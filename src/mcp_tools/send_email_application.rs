@@ -10,12 +10,8 @@ pub struct SendEmailApplicationTool;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SendEmailApplicationParams {
-    /// Recipient email address (the company's jobs alias, recruiter, etc.).
     pub to: String,
-    /// Email subject line — e.g. "Application: Senior Rust Engineer".
     pub subject: String,
-    /// Plain-text email body (the cover letter). Keep it concise; most
-    /// recruiters don't read past 300 words.
     pub body: String,
     /// Optional attachment path (e.g. a PDF). Any file under
     /// `/tmp/jarvis_downloads/` works.

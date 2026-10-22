@@ -28,8 +28,8 @@ impl Tool for GmailListRecentTool {
 
     fn description(&self) -> &'static str {
         "List the most recent Gmail inbox messages as summaries (uid, subject, from, \
-         date). Read-only — does not mark anything read. Use for daily triage of job \
-         application follow-ups (interview invites, rejections, recruiter outreach)."
+         date). Read-only — does not mark anything read. Use for a quick daily inbox \
+         triage."
     }
 
     fn run<'a>(

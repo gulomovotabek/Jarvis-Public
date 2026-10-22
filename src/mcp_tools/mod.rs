@@ -431,11 +431,6 @@ mod tests {
     fn registry_has_all_expected_tools() {
         let names: Vec<&'static str> = global().names().collect();
 
-        // Core (always-compiled) tools, after the job-application subsystem
-        // (ATS apply, LinkedIn, resumes, answer bank, job profile, application
-        // tracking, dispatch_campaign) was removed. Includes weather,
-        // currency_rates, youtube_transcript, transcribe_voice,
-        // send_location, send_contact.
         let mut expected_minimum = 60;
         #[cfg(feature = "faceit")]
         {

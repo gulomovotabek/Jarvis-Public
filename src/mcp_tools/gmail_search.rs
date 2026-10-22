@@ -14,10 +14,6 @@ fn default_limit() -> u32 {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GmailSearchParams {
-    /// Search query. Two forms supported:
-    /// - Plain substring (e.g. `"interview"`) — searches subject + body
-    /// - `gmail:` prefix (e.g. `"gmail:from:recruiter@ newer_than:7d"`) — Gmail's
-    ///   native search syntax via `X-GM-RAW`
     pub query: String,
     /// Max messages to return.
     #[serde(default = "default_limit")]
@@ -34,8 +30,8 @@ impl Tool for GmailSearchTool {
     fn description(&self) -> &'static str {
         "Search Gmail INBOX. Plain queries match subject/body; prefix with `gmail:` to \
          use Gmail's native search syntax (from:, subject:, newer_than:, has:attachment, \
-         etc). Use this to find all messages related to a specific application or to \
-         detect rejection/interview emails in the last N days."
+         etc). Use this to find all messages about a specific topic or from a specific \
+         sender in the last N days."
     }
 
     fn run<'a>(
