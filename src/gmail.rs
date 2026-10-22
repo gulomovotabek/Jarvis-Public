@@ -308,8 +308,6 @@ impl GmailClient {
     }
 }
 
-/// Decode quoted-printable-ish text heuristically, strip HTML tags, collapse
-/// whitespace, truncate. Good enough for application emails.
 fn clean_body(input: &str, max: usize) -> String {
     // Drop any HTML tags and collapse whitespace.
     let mut out = String::with_capacity(input.len().min(max));

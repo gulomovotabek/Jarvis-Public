@@ -78,7 +78,7 @@ impl ScheduledTaskService {
              {}\n\n\
              NOTIFICATION RULES — read carefully:\n\
              • If there is nothing worth notifying about (no new emails, no \
-               new jobs, no state change, polling returned identical data \
+               new items, no state change, polling returned identical data \
                to last time, etc.) respond with EXACTLY the single token \
                [SILENT] and nothing else. Do not explain. Do not apologize. \
                Do not include details about what you checked. Just [SILENT].\n\
@@ -201,8 +201,8 @@ mod silent_tests {
 
     #[test]
     fn allows_actual_content() {
-        assert!(!is_silent_response("You got an interview invitation from Google."));
-        assert!(!is_silent_response("2 new jobs found matching rust backend"));
+        assert!(!is_silent_response("Your package was delivered today."));
+        assert!(!is_silent_response("2 new emails from the bank"));
     }
 }
 

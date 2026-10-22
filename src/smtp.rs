@@ -1,13 +1,7 @@
-//! Outbound SMTP client for sending job application emails.
-//!
 //! Reuses the same `GMAIL_IMAP_USER` + `GMAIL_APP_PASSWORD` that the `gmail`
 //! feature uses for IMAP reads — Gmail app passwords work for both IMAP and
 //! SMTP. Override via `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_HOST`, `SMTP_PORT`
 //! if you want to send from a different account.
-//!
-//! Attachments are opened lazily from disk at send time (so e.g. the PDF
-//! materialized by `get_resume_pdf` can be attached without round-tripping
-//! through base64 in the tool layer).
 
 use anyhow::{Context, Result};
 use lettre::message::header::ContentType;

@@ -13,13 +13,13 @@ default = ["faceit", "sheets", "gmail", "pdf", "smtp", "rss", "calendar"]
 faceit = []
 # Google Sheets integration: service-account JWT auth + Sheets v4 CRUD.
 sheets = ["dep:jsonwebtoken"]
-# Gmail IMAP integration for reading inbox/sent (follow-up tracking,
-# rejection/interview email detection). Uses app-password auth.
+# Gmail IMAP integration for reading inbox/sent (search, follow-up tracking).
+# Uses app-password auth.
 gmail = ["dep:imap", "dep:native-tls"]
-# PDF text extraction — for reading uploaded resumes, job descriptions, etc.
+# PDF text extraction — for reading uploaded documents, invoices, etc.
 # Text-based PDFs only (no OCR).
 pdf = ["dep:pdf-extract"]
-# SMTP outbound: sends job application emails with file attachments. Defaults
+# SMTP outbound: sends plain-text emails with file attachments. Defaults
 # to reusing the Gmail app password already used by the `gmail` feature.
 smtp = ["dep:lettre"]
 # RSS/Atom feed reading — stable news source (no scraping/bot-detection).
