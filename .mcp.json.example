@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "telegram": {
+      "command": "/opt/jarvis/bin/mcp-telegram",
+      "args": [],
+      "cwd": "/opt/jarvis"
+    }
+  }
+}

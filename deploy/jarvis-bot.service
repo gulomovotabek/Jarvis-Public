@@ -1,0 +1,39 @@
+[Unit]
+Description=Telegram Codex Jarvis bot
+After=network-online.target
+Wants=network-online.target
+# Crash-loop guard (replaces the jarvis-wrapper binary): if it restarts more
+# than 10 times in 5 minutes, stop and require manual intervention.
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=__USER__
+Group=__USER__
+WorkingDirectory=/opt/jarvis
+
+# All runtime config comes from /opt/jarvis/.env (loaded by dotenvy in both the
+# bot and the mcp-telegram process).
+# claude CLI auth: either put ANTHROPIC_API_KEY in /opt/jarvis/.env (API billing),
+# or run `claude setup-token` as User=__USER__ so ~/.claude/.credentials.json
+# exists (subscription billing). HOME must point at that user for OAuth creds.
+Environment=HOME=/home/__USER__
+
+ExecStart=/opt/jarvis/bin/telegram-codex-jarvis
+
+Restart=always
+RestartSec=3
+
+# Graceful shutdown: the bot records a clean_shutdown heartbeat on SIGTERM.
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+# Hardening (loosened where the bot legitimately needs write access).
+NoNewPrivileges=true
+ProtectSystem=full
+ReadWritePaths=/opt/jarvis
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

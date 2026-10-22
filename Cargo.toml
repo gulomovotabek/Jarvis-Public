@@ -1,0 +1,66 @@
+[package]
+name = "telegram-codex-jarvis"
+version = "0.2.0"
+license = "MIT"
+edition = "2021"
+
+[features]
+# Default build includes every optional integration. Production deploy relies
+# on this. Downstream consumers can opt out for lean builds.
+default = ["faceit", "sheets", "gmail", "pdf", "smtp", "rss", "calendar"]
+# FACEIT CS2 integration: HTTP API client only (player profile, match history,
+# match scoreboard). No extra deps.
+faceit = []
+# Google Sheets integration: service-account JWT auth + Sheets v4 CRUD.
+sheets = ["dep:jsonwebtoken"]
+# Gmail IMAP integration for reading inbox/sent (follow-up tracking,
+# rejection/interview email detection). Uses app-password auth.
+gmail = ["dep:imap", "dep:native-tls"]
+# PDF text extraction — for reading uploaded resumes, job descriptions, etc.
+# Text-based PDFs only (no OCR).
+pdf = ["dep:pdf-extract"]
+# SMTP outbound: sends job application emails with file attachments. Defaults
+# to reusing the Gmail app password already used by the `gmail` feature.
+smtp = ["dep:lettre"]
+# RSS/Atom feed reading — stable news source (no scraping/bot-detection).
+rss = ["dep:feed-rs"]
+# Google Calendar integration: reuses the same service-account key as `sheets`.
+calendar = ["dep:jsonwebtoken"]
+
+[dependencies]
+anyhow = "1"
+axum = "0.7"
+base64 = "0.22"
+dotenvy = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite"] }
+teloxide = { version = "0.13", features = ["macros", "ctrlc_handler", "rustls", "webhooks", "webhooks-axum"] }
+futures-core = "0.3"
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls", "native-tls", "cookies", "multipart"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "process", "time", "io-util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+url = "2"
+ctrlc = "3"
+cron = "0.15"
+chrono = "0.4"
+chrono-tz = "0.10"
+sqlparser = "0.61"
+schemars = { version = "0.8", features = ["derive"] }
+
+# Optional dependencies — enabled via features above.
+jsonwebtoken = { version = "9", optional = true }
+feed-rs = { version = "2", optional = true }
+imap = { version = "2", optional = true }
+native-tls = { version = "0.2", optional = true }
+pdf-extract = { version = "0.10", optional = true }
+lettre = { version = "0.11", optional = true, default-features = false, features = ["tokio1-rustls-tls", "smtp-transport", "builder"] }
+
+[[bin]]
+name = "mcp-telegram"
+path = "src/bin/mcp_server.rs"
+
+[[bin]]
+name = "jarvis-wrapper"
+path = "src/bin/wrapper.rs"

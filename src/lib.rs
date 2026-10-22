@@ -1,0 +1,27 @@
+#![recursion_limit = "256"]
+
+pub mod chat_profiles;
+pub mod claude_code;
+pub mod config;
+pub mod db;
+#[cfg(feature = "faceit")]
+pub mod faceit;
+pub mod focus;
+#[cfg(feature = "calendar")]
+pub mod google_calendar;
+#[cfg(feature = "sheets")]
+pub mod google_sheets;
+pub mod formatting;
+#[cfg(feature = "gmail")]
+pub mod gmail;
+pub mod mcp;
+pub mod mcp_tools;
+pub mod memory;
+#[cfg(feature = "smtp")]
+pub mod smtp;
+pub mod metrics;
+pub mod proactive;
+pub mod rag;
+pub mod reminders;
+pub mod scheduled_tasks;
+pub mod security;

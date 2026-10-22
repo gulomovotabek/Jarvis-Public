@@ -1,0 +1,14 @@
+# /etc/caddy/Caddyfile — reverse proxy + automatic Let's Encrypt TLS.
+# Recommended prod ingress when the box has a public IP and a DNS A record
+# pointing at it, with ports 80 + 443 open. Caddy fetches/renews certs itself.
+#
+# Telegram only delivers webhooks to public URLs on 443/80/88/8443 — Caddy
+# terminates TLS on 443, so set WEBHOOK_URL=https://jarvis.example.com/<path>
+# and WEBHOOK_BIND to the internal upstream below (port is arbitrary).
+#
+# Behind NAT / dynamic IP / no open inbound ports → use cloudflared instead
+# (see deploy/README.md), and skip Caddy entirely.
+
+jarvis.example.com {
+	reverse_proxy 127.0.0.1:8081
+}

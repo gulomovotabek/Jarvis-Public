@@ -1,0 +1,12 @@
+/target
+/target_rel*
+/data
+/.env
+/node_modules
+*.log
+*.session
+*.db
+.claude/
+.mcp.json
+*.service-account.json
+ecstatic-backup-*.json

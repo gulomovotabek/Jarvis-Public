@@ -1,0 +1,5 @@
+# /etc/sudoers.d/jarvis — install with mode 0440, owned by root:root.
+# Grants the deploy user passwordless control of ONLY the jarvis units.
+# Replaces the insecure `echo '1' | sudo -S` pattern from the Windows/WSL era.
+# Validate before installing:  visudo -cf deploy/jarvis.sudoers
+__USER__ ALL=(root) NOPASSWD: /usr/bin/systemctl start jarvis-bot, /usr/bin/systemctl stop jarvis-bot, /usr/bin/systemctl restart jarvis-bot, /usr/bin/systemctl status jarvis-bot, /usr/bin/journalctl -u jarvis-bot *

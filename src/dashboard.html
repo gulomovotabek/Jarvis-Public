@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jarvis Dashboard</title>
+<style>
+  :root {
+    --bg:#0f1115; --panel:#171a21; --panel2:#1e222b; --line:#2a2f3a;
+    --txt:#e6e9ef; --mut:#8b93a3; --acc:#5b9cff; --ok:#3fb950; --warn:#d29922; --err:#f85149;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt);
+    font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+  header { display:flex; align-items:center; gap:14px; padding:12px 18px;
+    background:var(--panel); border-bottom:1px solid var(--line); position:sticky; top:0; z-index:10; }
+  header h1 { font-size:16px; margin:0; font-weight:600; }
+  .dot { width:10px; height:10px; border-radius:50%; background:var(--mut); display:inline-block; }
+  .dot.ok { background:var(--ok); box-shadow:0 0 8px var(--ok); }
+  .dot.err { background:var(--err); box-shadow:0 0 8px var(--err); }
+  .hstat { color:var(--mut); font-size:12px; }
+  .hstat b { color:var(--txt); }
+  nav { display:flex; gap:4px; padding:8px 14px; background:var(--panel);
+    border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  nav button { background:transparent; border:1px solid transparent; color:var(--mut);
+    padding:6px 14px; border-radius:7px; cursor:pointer; font-size:13px; }
+  nav button.active { background:var(--panel2); color:var(--txt); border-color:var(--line); }
+  main { padding:18px; max-width:1200px; margin:0 auto; }
+  .tab { display:none; }
+  .tab.active { display:block; }
+  .grid { display:grid; gap:14px; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px 16px; }
+  .card h3 { margin:0 0 6px; font-size:12px; color:var(--mut); font-weight:500; text-transform:uppercase; letter-spacing:.04em; }
+  .big { font-size:26px; font-weight:600; }
+  .sub { color:var(--mut); font-size:12px; margin-top:2px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px; margin-top:14px; }
+  .panel h2 { margin:0 0 12px; font-size:14px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:left; padding:7px 8px; border-bottom:1px solid var(--line); }
+  th { color:var(--mut); font-weight:500; }
+  td.num, th.num { text-align:right; font-variant-numeric:tabular-nums; }
+  .gauge { height:14px; background:var(--panel2); border-radius:7px; overflow:hidden; }
+  .gauge > div { height:100%; background:linear-gradient(90deg,var(--ok),var(--warn),var(--err)); }
+  select, input { background:var(--panel2); color:var(--txt); border:1px solid var(--line);
+    border-radius:7px; padding:6px 10px; font-size:13px; }
+  button.act { background:var(--acc); color:#06122b; border:none; border-radius:7px; padding:6px 14px; cursor:pointer; font-weight:600; }
+  .msg { padding:8px 10px; border-bottom:1px solid var(--line); }
+  .msg .meta { font-size:12px; color:var(--mut); display:flex; gap:8px; }
+  .msg .meta .who { color:var(--acc); font-weight:600; }
+  .msg .meta .who.bot { color:var(--ok); }
+  .msg .body { white-space:pre-wrap; word-break:break-word; margin-top:2px; }
+  .heat { display:flex; gap:3px; flex-wrap:wrap; }
+  .heat .cell { width:30px; height:30px; border-radius:5px; display:flex; align-items:center;
+    justify-content:center; font-size:9px; color:var(--mut); background:var(--panel2); }
+  .err { color:var(--err); } .ok { color:var(--ok); } .mut { color:var(--mut); }
+  svg text { fill:var(--mut); font-size:10px; }
+  .note { font-size:12px; color:var(--warn); margin-top:8px; }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="statusDot"></span>
+  <h1>Jarvis Dashboard</h1>
+  <span class="hstat">claude <b id="hClaude">–</b></span>
+  <span class="hstat">model <b id="hModel">–</b></span>
+  <span class="hstat">uptime <b id="hUptime">–</b></span>
+  <span class="hstat">hb <b id="hHb">–</b></span>
+  <span class="hstat" style="margin-left:auto" id="hUpdated">–</span>
+</header>
+<nav>
+  <button data-tab="overview" class="active">Overview</button>
+  <button data-tab="messages">Messages</button>
+  <button data-tab="usage">Usage</button>
+  <button data-tab="tools">Tools</button>
+  <button data-tab="behavior">Behavior</button>
+</nav>
+<main>
+  <section class="tab active" id="tab-overview">
+    <div class="panel" id="livePanel">
+      <h2>Right now</h2>
+      <div class="sub" style="font-size:15px"><span class="dot" id="liveDot"></span> <b id="liveState">–</b> <span class="mut" id="liveModel"></span></div>
+    </div>
+    <div class="grid" id="ovCards"></div>
+    <div class="panel">
+      <h2>Session · turns to rotation</h2>
+      <div class="gauge"><div id="ctxBar" style="width:0%"></div></div>
+      <div class="sub" id="ctxText">–</div>
+    </div>
+    <div class="panel">
+      <h2>Claude turn latency</h2>
+      <div class="grid" id="latCards"></div>
+    </div>
+  </section>
+
+  <section class="tab" id="tab-messages">
+    <div class="panel">
+      <div class="row" style="margin-bottom:12px">
+        <select id="chatSel"><option value="">All chats</option></select>
+        <button class="act" id="msgReload">Reload</button>
+        <span class="mut" id="msgCount"></span>
+      </div>
+      <div id="msgList"></div>
+      <div style="text-align:center; margin-top:12px">
+        <button class="act" id="msgMore">Load more</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="tab" id="tab-usage">
+    <div class="grid" id="usageCards"></div>
+    <div class="panel"><h2>Tokens per turn (in / out)</h2><div id="chartTokens"></div></div>
+    <div class="panel"><h2>API latency per turn (ms)</h2><div id="chartLatency"></div></div>
+    <div class="note" id="costNote"></div>
+  </section>
+
+  <section class="tab" id="tab-tools">
+    <div class="panel"><h2>MCP tool usage</h2><table id="toolTbl"><thead><tr>
+      <th>Tool</th><th class="num">Calls</th><th class="num">Errors</th>
+      <th class="num">Mean ms</th><th>Last</th></tr></thead><tbody></tbody></table>
+      <div class="mut" id="toolEmpty"></div></div>
+  </section>
+
+  <section class="tab" id="tab-behavior">
+    <div class="grid" id="behCards"></div>
+    <div class="panel"><h2>Messages per day (30d)</h2><div id="chartPerDay"></div></div>
+    <div class="panel"><h2>Active hours (UTC)</h2><div class="heat" id="heat"></div></div>
+    <div class="panel"><h2>Scheduled tasks</h2><table id="schedTbl"><thead><tr>
+      <th>Name</th><th>Cron</th><th>Enabled</th><th>Last run</th><th>Next run</th></tr></thead><tbody></tbody></table></div>
+    <div class="panel"><h2>Chat style profiles</h2><div id="profiles"></div></div>
+  </section>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+const fmt = n => (n==null?'–':Number(n).toLocaleString());
+const pad = n => String(n).padStart(2,'0');
+function ago(ts){ if(!ts) return '–'; const s=Math.max(0,Math.floor(Date.now()/1000)-ts);
+  if(s<60) return s+'s'; if(s<3600) return Math.floor(s/60)+'m'; if(s<86400) return Math.floor(s/3600)+'h';
+  return Math.floor(s/86400)+'d'; }
+function dur(s){ if(s==null) return '–'; const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);
+  if(d) return d+'d '+h+'h'; if(h) return h+'h '+m+'m'; return m+'m'; }
+function dt(ts){ if(!ts) return '–'; const d=new Date(ts*1000);
+  return pad(d.getMonth()+1)+'/'+pad(d.getDate())+' '+pad(d.getHours())+':'+pad(d.getMinutes()); }
+async function get(p){ const r=await fetch(p); if(!r.ok) throw new Error(r.status); return r.json(); }
+
+function card(label,value,sub){ return `<div class="card"><h3>${label}</h3><div class="big">${value}</div>${sub?`<div class="sub">${sub}</div>`:''}</div>`; }
+
+function lineChart(series, w=1080, h=180, pad=28){
+  // series: [{vals:[], color:''}]  x = index
+  const all = series.flatMap(s=>s.vals); if(!all.length) return '<div class="mut">no data</div>';
+  const max = Math.max(1,...all), n = Math.max(...series.map(s=>s.vals.length));
+  const X = i => pad + (n<=1?0:(w-2*pad)*i/(n-1));
+  const Y = v => h-pad - (h-2*pad)*v/max;
+  let g = `<svg viewBox="0 0 ${w} ${h}" width="100%" preserveAspectRatio="none">`;
+  for(let k=0;k<=4;k++){ const y=pad+(h-2*pad)*k/4; g+=`<line x1="${pad}" y1="${y}" x2="${w-pad}" y2="${y}" stroke="#2a2f3a"/>`;
+    g+=`<text x="2" y="${y+3}">${fmt(Math.round(max*(4-k)/4))}</text>`; }
+  for(const s of series){ if(s.vals.length<1) continue;
+    let d = s.vals.map((v,i)=>`${i?'L':'M'}${X(i).toFixed(1)},${Y(v).toFixed(1)}`).join(' ');
+    g+=`<path d="${d}" fill="none" stroke="${s.color}" stroke-width="1.6"/>`; }
+  g+='</svg>'; return g;
+}
+function barChart(vals, labels, w=1080, h=180, pad=28){
+  if(!vals.length) return '<div class="mut">no data</div>';
+  const max=Math.max(1,...vals), bw=(w-2*pad)/vals.length;
+  let g=`<svg viewBox="0 0 ${w} ${h}" width="100%" preserveAspectRatio="none">`;
+  vals.forEach((v,i)=>{ const bh=(h-2*pad)*v/max, x=pad+i*bw+1, y=h-pad-bh;
+    g+=`<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${(bw-2).toFixed(1)}" height="${bh.toFixed(1)}" fill="#5b9cff" rx="2"/>`; });
+  g+=`<text x="${pad}" y="12">max ${fmt(max)}</text></svg>`; return g;
+}
+
+/* ---- Overview ---- */
+async function loadOverview(){
+  const m = await get('/api/metrics');
+  $('#statusDot').className = 'dot '+(m.status==='ok'?'ok':'err');
+  $('#hClaude').textContent = m.claude.alive?'alive':'down';
+  $('#hUptime').textContent = dur(m.uptime_secs);
+  $('#hHb').textContent = m.claude.last_heartbeat_secs_ago+'s';
+  $('#hModel').textContent = m.model||'–';
+  $('#hUpdated').textContent = 'updated '+pad(new Date().getHours())+':'+pad(new Date().getMinutes())+':'+pad(new Date().getSeconds());
+  const busy = m.claude.busy;
+  $('#liveDot').className = 'dot '+(busy?'ok':'');
+  $('#liveState').textContent = busy ? ((m.claude.activity||'Working')+' · '+m.claude.busy_for_secs+'s') : 'Idle — waiting for a message';
+  $('#liveModel').textContent = 'model '+(m.model||'?');
+  const c = m.counters;
+  const errRate = c.claude_calls? (100*c.claude_errors/c.claude_calls).toFixed(1)+'%':'0%';
+  $('#ovCards').innerHTML =
+    card('Messages received', fmt(c.messages_received), 'last '+ago(c.last_message_at)) +
+    card('Responded', fmt(c.messages_responded), 'last '+ago(c.last_response_at)) +
+    card('Dropped (stale)', fmt(c.messages_dropped_stale)) +
+    card('Claude calls', fmt(c.claude_calls), 'session turns '+fmt(m.claude.session_turns)) +
+    card('Claude errors', fmt(c.claude_errors), 'rate '+errRate);
+  const l = c.claude_turn_duration||{};
+  $('#latCards').innerHTML =
+    card('p50', fmt(l.p50_ms)+' ms') + card('p90', fmt(l.p90_ms)+' ms') +
+    card('p99', fmt(l.p99_ms)+' ms') + card('max', fmt(l.max_ms)+' ms') +
+    card('mean', fmt(l.mean_ms)+' ms','n='+fmt(l.count));
+  // session rotation gauge — turns since the current session started vs the
+  // rotation cap the bot enforces (exact, unlike token-based context guessing)
+  const turns = m.claude.session_turns||0, maxT = m.claude.session_max_turns||0;
+  if(maxT > 0){
+    const pct = Math.min(100, 100*turns/maxT);
+    $('#ctxBar').style.width = pct.toFixed(1)+'%';
+    $('#ctxText').textContent = `turn ${fmt(turns)} / ${fmt(maxT)} (${pct.toFixed(1)}%) — fresh session at ${fmt(maxT)}`;
+  } else {
+    $('#ctxBar').style.width = '0%';
+    $('#ctxText').textContent = `turn ${fmt(turns)} — no rotation cap (Claude auto-compacts)`;
+  }
+}
+
+/* ---- Messages ---- */
+let msgBefore=null, msgChat='';
+async function loadChats(){
+  const d = await get('/api/chats');
+  const sel=$('#chatSel'); sel.innerHTML='<option value="">All chats</option>';
+  for(const c of d.chats){ const o=document.createElement('option'); o.value=c.chat_id;
+    o.textContent=(c.title||c.chat_id)+' ('+fmt(c.count)+')'; sel.appendChild(o); }
+}
+async function loadMessages(reset){
+  if(reset){ msgBefore=null; $('#msgList').innerHTML=''; }
+  let q='/api/messages?limit=50'; if(msgChat) q+='&chat_id='+msgChat; if(msgBefore) q+='&before_id='+msgBefore;
+  const d = await get(q);
+  const html = d.messages.map(m=>{
+    const link = m.message_link?` · <a href="${m.message_link}" target="_blank" style="color:var(--mut)">link</a>`:'';
+    return `<div class="msg"><div class="meta"><span class="who ${m.is_bot?'bot':''}">${m.sender_name||'?'}</span>
+      <span>${dt(m.created_at)}</span><span class="mut">${m.chat_title||m.chat_id}</span>${link}</div>
+      <div class="body">${(m.content||'').replace(/[<>&]/g,x=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[x]))||'<span class=mut>(no text)</span>'}</div></div>`;
+  }).join('');
+  $('#msgList').insertAdjacentHTML('beforeend', html);
+  msgBefore = d.next_before_id;
+  $('#msgMore').style.display = (d.messages.length<50||!msgBefore)?'none':'inline-block';
+  $('#msgCount').textContent = $('#msgList').children.length+' shown';
+}
+
+/* ---- Usage ---- */
+async function loadUsage(){
+  const d = await get('/api/turns?limit=200');
+  const t=d.totals, h=d.last_24h;
+  $('#usageCards').innerHTML =
+    card('Total turns', fmt(t.turns)) +
+    card('Input tokens', fmt(t.input_tokens), '24h '+fmt(h.input_tokens)) +
+    card('Output tokens', fmt(t.output_tokens), '24h '+fmt(h.output_tokens)) +
+    card('Cache-write tokens', fmt(t.cache_creation_tokens), 'main cost driver') +
+    card('Cache-read tokens', fmt(t.cache_read_tokens)) +
+    card('Est. cost (official rate)', '$'+(t.cost_usd||0).toFixed(2), '24h $'+(h.cost_usd||0).toFixed(2));
+  $('#chartTokens').innerHTML = lineChart([
+    {vals:d.turns.map(x=>x.input_tokens), color:'#5b9cff'},
+    {vals:d.turns.map(x=>x.output_tokens), color:'#3fb950'}]);
+  $('#chartLatency').innerHTML = lineChart([
+    {vals:d.turns.map(x=>x.duration_api_ms||0), color:'#d29922'}]);
+  $('#costNote').textContent = 'Cost computed from tokens at official Opus 4.8 rates ($/1M: input 5, output 25, cache-write 6.25, cache-read 0.5). Estimate only — actual billed spend may differ (subscription plans, proxies, discounts). Cache-write cost grows when prompt caching misses.';
+}
+
+/* ---- Tools ---- */
+async function loadTools(){
+  const d = await get('/api/tools');
+  const tb=$('#toolTbl tbody'); tb.innerHTML='';
+  for(const t of d.tools){ tb.insertAdjacentHTML('beforeend',
+    `<tr><td>${t.name}</td><td class="num">${fmt(t.calls)}</td>
+     <td class="num ${t.errors?'err':''}">${fmt(t.errors)}</td>
+     <td class="num">${fmt(t.mean_ms)}</td><td class="mut">${ago(t.last_at)} ago</td></tr>`); }
+  $('#toolEmpty').textContent = d.tools.length?'':'No tool calls recorded yet.';
+}
+
+/* ---- Behavior ---- */
+async function loadBehavior(){
+  const d = await get('/api/behavior');
+  $('#behCards').innerHTML =
+    card('Stored memories', fmt(d.memory_count)) +
+    card('Reminders fired', fmt(d.reminders_fired)) +
+    card('Scheduled tasks', fmt(d.scheduled_tasks.length)) +
+    card('Active chats', fmt(new Set(d.messages_per_day.map(x=>x.day_epoch)).size? d.profiles.length: d.profiles.length));
+  $('#chartPerDay').innerHTML = barChart(d.messages_per_day.map(x=>x.count), []);
+  const max=Math.max(1,...d.active_hours_utc);
+  $('#heat').innerHTML = d.active_hours_utc.map((v,i)=>{
+    const a=(0.12+0.88*v/max).toFixed(2);
+    return `<div class="cell" title="${v} msgs" style="background:rgba(91,156,255,${a})">${i}</div>`;}).join('');
+  const st=$('#schedTbl tbody'); st.innerHTML='';
+  for(const s of d.scheduled_tasks){ st.insertAdjacentHTML('beforeend',
+    `<tr><td>${s.name}</td><td class="mut">${s.cron}</td>
+     <td class="${s.enabled?'ok':'mut'}">${s.enabled?'yes':'no'}</td>
+     <td class="mut">${s.last_run_at?dt(s.last_run_at):'–'}</td>
+     <td class="mut">${s.next_run_at?dt(s.next_run_at):'–'}</td></tr>`); }
+  $('#profiles').innerHTML = d.profiles.length? d.profiles.map(p=>
+    `<div class="msg"><div class="meta"><span class="who">${p.title||p.chat_id}</span>
+     <span>${p.analyzed_at?dt(p.analyzed_at):''}</span></div>
+     <div class="body">${(p.instruction||'').replace(/[<>&]/g,x=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[x]))}</div></div>`).join('')
+     : '<div class="mut">No profiles analyzed yet.</div>';
+}
+
+/* ---- tabs + polling ---- */
+let active='overview', timer=null;
+const loaders={overview:loadOverview,usage:loadUsage,tools:loadTools,behavior:loadBehavior};
+function run(fn){ fn().catch(e=>console.error(e)); }
+function schedule(){ if(timer) clearInterval(timer);
+  // live-refresh only the cheap, time-sensitive tabs
+  if(active==='overview'||active==='usage') timer=setInterval(()=>run(loaders[active]),3000); }
+document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
+  document.querySelectorAll('nav button').forEach(x=>x.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
+  b.classList.add('active'); active=b.dataset.tab;
+  $('#tab-'+active).classList.add('active');
+  if(active==='messages'){ loadChats(); loadMessages(true); }
+  else run(loaders[active]);
+  schedule();
+});
+$('#msgReload').onclick=()=>{ msgChat=$('#chatSel').value; loadMessages(true); };
+$('#chatSel').onchange=()=>{ msgChat=$('#chatSel').value; loadMessages(true); };
+$('#msgMore').onclick=()=>loadMessages(false);
+run(loadOverview); schedule();
+</script>
+</body>
+</html>
