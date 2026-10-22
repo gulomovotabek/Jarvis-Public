@@ -13,7 +13,7 @@ use telegram_codex_jarvis::rag::{format_context, truncate, RagService};
 use telegram_codex_jarvis::security::{SecurityDecision, SecurityGate};
 use anyhow::{Context, Result};
 use base64::Engine as _;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use teloxide::dispatching::UpdateFilterExt;
 use teloxide::error_handlers::LoggingErrorHandler;
@@ -80,7 +80,9 @@ pub struct AppState {
     pub db: Database,
     pub rag: RagService,
     pub started_at: i64,
+    pub accept_messages_since: i64,
     pub claude: Arc<ClaudeCode>,
+    pub guest_claude: Option<Arc<ClaudeCode>>,
     pub bot_username: String,
     pub bot_user_id: i64,
     pub focus: Arc<FocusManager>,
@@ -286,7 +288,7 @@ async fn ingest_message<'a>(
 
     // Skip stale messages from before this process started (e.g. queued
     // updates that arrive after a restart).
-    if seen_at < state.started_at {
+    if seen_at < state.accept_messages_since {
         info!(chat_id, "msg_skipped_stale");
         state.metrics.inc(&state.metrics.messages_dropped_stale);
         return Ok(None);
@@ -405,7 +407,10 @@ async fn classify_message(
     // reach a response, proactive, or monitored-group path. This also guarantees
     // owner-only tools (e.g. browser control) are unreachable by non-owners,
     // since only owner turns ever drive the shared Claude subprocess.
-    if state.config.owner_user_id != Some(ctx.sender_id) {
+    let is_group = ctx.message.chat.is_group() || ctx.message.chat.is_supergroup();
+    let is_guest = is_guest_sender(&state.config, Some(ctx.sender_id));
+    let guest_allowed = is_group && !ctx.user_is_bot && state.guest_claude.is_some();
+    if is_guest && !guest_allowed {
         return Ok(Disposition::Drop);
     }
 
@@ -439,8 +444,7 @@ async fn classify_message(
         // No direct trigger, not in a monitored group — consider the
         // proactive path (active follow-up OR cold LLM trigger).
         let followup_enabled = state.config.active_followup_secs > 0;
-        let cold_enabled = state.config.proactive_cold_trigger_enabled;
-        let is_group = ctx.message.chat.is_group() || ctx.message.chat.is_supergroup();
+        let cold_enabled = state.config.proactive_cold_trigger_enabled && !is_guest;
         if !ctx.user_is_bot && is_group && (followup_enabled || cold_enabled) {
             return Ok(Disposition::SpawnProactive);
         }
@@ -763,6 +767,12 @@ async fn generate_and_send_response_batch(
     let thread_id = last.thread_id;
     let message_id = last.message_id;
     let _is_proactive = batch.iter().any(|m| m.is_proactive);
+    let is_guest = batch.iter().any(|m| is_guest_sender(&state.config, m.sender_id));
+    let claude = if is_guest {
+        state.guest_claude.as_ref().context("guest batch without guest claude")?
+    } else {
+        &state.claude
+    };
     let batch_size = batch.len();
     info!(chat_id = chat_id.0, batch_size, "batch_start");
     state.metrics.inc(&state.metrics.claude_calls);
@@ -780,10 +790,11 @@ async fn generate_and_send_response_batch(
     bot.send_chat_action(chat_id, ChatAction::Typing).await?;
 
     let rag_query = &last.text;
-    let retrieved = state
-        .rag
-        .search(rag_query)
-        .await?;
+    let retrieved = if is_guest {
+        Vec::new()
+    } else {
+        state.rag.search(rag_query).await?
+    };
     let context = format_context(&retrieved, state.config.max_context_chars);
     let recent_messages = state.db.fetch_recent_chat_messages_for_thread(
         chat_id.0, thread_id.map(|t| t as i64), 4
@@ -795,12 +806,12 @@ async fn generate_and_send_response_batch(
     );
 
     let chat_style = state.chat_profiles.get_profile(chat_id.0).await;
-    let system_prompt = build_system_prompt(&state.config, sender_id, &recent_messages, chat_style.as_deref());
+    let chat_guidance = build_chat_guidance(state.config.owner_user_id, &state.config.owner_user_ids, sender_id, &recent_messages, chat_style.as_deref());
 
     let default_rules =
         "- Javob doim ozbek tilida bolsin.\n- Tarix umuman topilmasa, buni ochiq ayt; yetarli tarix bo'lsa 'tarix toliq emas' demang.";
     let configured_rules = state.config.user_rules_template.trim();
-    let rules = if configured_rules.is_empty() {
+    let rules = if is_guest || configured_rules.is_empty() {
         default_rules
     } else {
         configured_rules
@@ -812,7 +823,7 @@ async fn generate_and_send_response_batch(
     let message_id_str = message_id.map(|m| m.to_string()).unwrap_or_else(|| "none".to_string());
 
     let user_prompt = format!(
-        "Chat: chat_id={} thread_id={} message_id={}\nRequester telegram_user_id={}\n{}\n\nRecent dialog window:\n{}\n\nRelevant history:\n{}\n\nRules:\n{}",
+        "Chat: chat_id={} thread_id={} message_id={}\nRequester telegram_user_id={}\n{}\n\nRecent dialog window:\n{}\n\nRelevant history:\n{}\n\nChat guidance:\n{}\n\nRules:\n{}",
         chat_id.0,
         thread_id_str,
         message_id_str,
@@ -820,14 +831,15 @@ async fn generate_and_send_response_batch(
         incoming_section,
         recent_dialog,
         context,
+        chat_guidance,
         rules
     );
 
     let answer = if !images.is_empty() {
         let refs: Vec<(&str, &str)> = images.iter().map(|(b, m)| (b.as_str(), m.as_str())).collect();
-        state.claude.send_message_with_images(&system_prompt, &user_prompt, &refs, &format!("Responding · chat {}", chat_id.0)).await
+        claude.send_message_with_images(&user_prompt, &refs, &format!("Responding · chat {}", chat_id.0)).await
     } else {
-        state.claude.send_message(&system_prompt, &user_prompt, &format!("Responding · chat {}", chat_id.0)).await
+        claude.send_message(&user_prompt, &format!("Responding · chat {}", chat_id.0)).await
     };
 
     let elapsed_ms = batch_start_time.elapsed().as_millis() as u64;
@@ -852,7 +864,16 @@ async fn generate_and_send_response_batch(
     // [BOT_SENT]/[SILENT]. If it instead returned plain text it never sent —
     // deliver that text as a fallback so the user always gets a reply.
     let trimmed = reply.trim();
-    if !trimmed.is_empty() && !trimmed.contains("[BOT_SENT]") && !trimmed.contains("[SILENT]") {
+    if is_guest && !trimmed.is_empty() && !trimmed.contains("[BOT_SENT]") && !trimmed.contains("[SILENT]") {
+        info!(chat_id = chat_id.0, "guest_reply");
+        let chars: Vec<char> = trimmed.chars().collect();
+        for chunk in chars.chunks(3500) {
+            let part: String = chunk.iter().collect();
+            if let Err(e) = send_markdown_like_message(bot, chat_id, &part, thread_id).await {
+                error!(chat_id = chat_id.0, ?e, "guest reply send failed");
+            }
+        }
+    } else if !trimmed.is_empty() && !trimmed.contains("[BOT_SENT]") && !trimmed.contains("[SILENT]") {
         info!(chat_id = chat_id.0, "claude returned plain text; sending as fallback");
         let chars: Vec<char> = trimmed.chars().collect();
         for chunk in chars.chunks(4000) {
@@ -895,6 +916,15 @@ async fn try_proactive_trigger(
     };
     let is_cold = secs_ago.is_none();
     let mode = if is_cold { "cold" } else { "warm" };
+    let is_guest = is_guest_sender(&state.config, sender_id);
+    let claude = if is_guest {
+        match state.guest_claude.as_ref() {
+            Some(guest) if !is_cold => guest,
+            _ => return Ok(()),
+        }
+    } else {
+        &state.claude
+    };
 
     // 2. Cold path requires the feature flag + global cooldown to avoid LLM hammering.
     if is_cold {
@@ -939,7 +969,7 @@ async fn try_proactive_trigger(
     // 5. LLM decision
     info!(chat_id, mode, "proactive_eval");
     let decision = match proactive::evaluate_proactive(
-        &state.claude,
+        claude,
         &recent,
         state.bot_user_id,
         false,
@@ -1341,16 +1371,18 @@ fn trigger_aliases(state: &AppState) -> Vec<String> {
     aliases
 }
 
-fn build_system_prompt(
-    config: &Config,
+fn is_guest_sender(config: &Config, sender_id: Option<i64>) -> bool {
+    !sender_id.is_some_and(|id| config.is_owner(id))
+}
+
+fn build_chat_guidance(
+    owner_user_id: Option<i64>,
+    owner_user_ids: &HashSet<i64>,
     requester_id: Option<i64>,
     recent_messages: &[RecentChatMessage],
     chat_style_instruction: Option<&str>,
 ) -> String {
-    let mut prompt = config.system_prompt_template.trim().to_string();
-    if !prompt.is_empty() && !prompt.ends_with(' ') {
-        prompt.push(' ');
-    }
+    let mut prompt = String::new();
 
     // Use rich per-chat profile if available, otherwise fall back to keyword-based tone detection
     if let Some(style) = chat_style_instruction {
@@ -1369,8 +1401,8 @@ fn build_system_prompt(
         }
     }
 
-    if let Some(owner) = config.owner_user_id {
-        if requester_id == Some(owner) {
+    if let Some(owner) = owner_user_id {
+        if requester_id.is_some_and(|id| owner_user_ids.contains(&id)) {
             prompt.push_str(
                 "Bu foydalanuvchi bot egasi. Unga doim hurmatli, professional va natijaga yo'naltirilgan javob bering. Zarur va tabiiy holatda uni 'Boss' deb chaqiring, lekin ortiqcha takrorlamang. Roast, sarkazm yoki slangni faqat chat konteksti mos bo'lsa va hurmat saqlansa ishlating. Emojini faqat zarur holatda ishlating. Sizda Telegram MCP vositalari mavjud — egasi so'raganda ularni ishlatishingiz mumkin. ",
             );
@@ -1381,13 +1413,7 @@ fn build_system_prompt(
         }
     }
 
-    prompt.push_str(
-        "Agar suhbatga o'zingiz qo'shilayotgan bo'lsangiz (sizni hech kim chaqirmagan), \
-         \"bu xabar menga yo'naltirilmagan\" yoki shunga o'xshash rad javobini HECH QACHON bermang. \
-         Tabiiy ravishda suhbatga qo'shiling: foydali fikr bildiring, savol bering yoki mavzuni rivojlantiring. "
-    );
-
-    prompt
+    prompt.trim_end().to_string()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1501,10 +1527,7 @@ async fn try_handle_bot_admin_command(
     if !message.chat.is_private() {
         return Ok(false);
     }
-    let Some(owner_id) = state.config.owner_user_id else {
-        return Ok(false);
-    };
-    if requester_id != owner_id {
+    if !state.config.is_owner(requester_id) {
         return Ok(false);
     }
 
@@ -1603,12 +1626,12 @@ fn is_desc_change_request(lower: &str) -> bool {
 /// Ask Claude to extract a value from a natural language command.
 /// Uses the main streaming subprocess to avoid rate limit contention.
 async fn extract_value_via_llm(claude: &ClaudeCode, kind: &str, user_message: &str) -> Result<String> {
-    let system = format!(
+    let prompt = format!(
         "Foydalanuvchi Telegram botning {kind}ini o'zgartirmoqchi. \
          Xabardan faqat yangi {kind} qiymatini chiqar. \
-         FAQAT qiymatni qaytar, hech qanday izoh, qo'shimcha so'z yoki tirnoq qo'shma."
+         FAQAT qiymatni qaytar, hech qanday izoh, qo'shimcha so'z yoki tirnoq qo'shma.\n\nXabar:\n{user_message}"
     );
-    let result = claude.send_message(&system, user_message, &format!("Extracting {kind}")).await?;
+    let result = claude.send_message(&prompt, &format!("Extracting {kind}")).await?;
     // Strip quotes, markdown, control chars
     let cleaned = result
         .trim()
@@ -1694,3 +1717,54 @@ async fn send_markdown_like_message(bot: &Bot, chat_id: ChatId, text: &str, thre
 
 // markdown_like_to_telegram_html, escape_html, apply_double_asterisk_bold
 // moved to telegram_codex_jarvis::formatting
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn recent(contents: &[&str]) -> Vec<RecentChatMessage> {
+        contents
+            .iter()
+            .enumerate()
+            .map(|(i, content)| RecentChatMessage {
+                sender_id: Some(1),
+                content: content.to_string(),
+                created_at: i as i64,
+                telegram_message_id: i as i64,
+                reply_to_message_id: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn chat_guidance_prefers_chat_style_and_marks_owner() {
+        let guidance = build_chat_guidance(Some(7), &HashSet::from([7]), Some(7), &[], Some("Style X."));
+        assert!(guidance.starts_with("Style X."));
+        assert!(guidance.contains("Bu foydalanuvchi bot egasi."));
+        assert!(!guidance.ends_with(' '));
+    }
+
+    #[test]
+    fn chat_guidance_falls_back_to_detected_tone_for_non_owner() {
+        let messages = recent(&["Assalomu alaykum, hurmatli hamkasblar", "Iltimos, rahmat sizga", "Marhamat, sizning fikringiz"]);
+        let guidance = build_chat_guidance(Some(7), &HashSet::from([7]), Some(1), &messages, None);
+        assert!(guidance.starts_with("Bu rasmiy guruh."));
+        assert!(guidance.contains("Telegram user id 7 bot egasi."));
+    }
+
+    #[test]
+    fn chat_guidance_empty_without_owner_or_tone() {
+        assert_eq!(build_chat_guidance(None, &HashSet::new(), Some(1), &[], None), "");
+    }
+
+    #[test]
+    fn chat_guidance_marks_every_owner_as_boss() {
+        let owners = HashSet::from([111111111, 2222222222]);
+        for id in [111111111, 2222222222] {
+            let guidance = build_chat_guidance(Some(111111111), &owners, Some(id), &[], None);
+            assert!(guidance.contains("Bu foydalanuvchi bot egasi."));
+        }
+        let guidance = build_chat_guidance(Some(111111111), &owners, Some(123), &[], None);
+        assert!(guidance.contains("Telegram user id 111111111 bot egasi."));
+    }
+}

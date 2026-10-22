@@ -178,7 +178,8 @@ async fn api_turns(
     if let Err(r) = auth(&headers, &state) {
         return r;
     }
-    match state.db.dash_turns(q.limit.unwrap_or(200)).await {
+    let model = state.config.claude_code_model.as_deref();
+    match state.db.dash_turns(q.limit.unwrap_or(200), model).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => err_json(e),
     }

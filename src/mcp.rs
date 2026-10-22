@@ -3,7 +3,7 @@ use crate::focus::FocusManager;
 use crate::memory::MemoryManager;
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use tracing::{error, info};
@@ -53,6 +53,7 @@ pub struct McpServer {
     /// Per-tool call/error counters + cumulative duration. Populated lazily on
     /// first call; entries are never removed.
     pub tool_metrics: Arc<ToolMetrics>,
+    pub tool_allowlist: Option<HashSet<String>>,
 }
 
 /// Process-local per-tool metrics. Each tool has a small stats struct
@@ -204,7 +205,12 @@ impl McpServer {
             }
             "notifications/initialized" | "initialized" => None,
             "tools/list" => {
-                let tools = crate::mcp_tools::list_definitions(crate::mcp_tools::global());
+                let mut tools = crate::mcp_tools::list_definitions(crate::mcp_tools::global());
+                tools.retain(|t| {
+                    t.get("name")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|name| tool_allowed(self.tool_allowlist.as_ref(), name))
+                });
                 Some(jsonrpc_response(id, json!({ "tools": tools })))
             }
             "tools/call" => {
@@ -242,7 +248,10 @@ impl McpServer {
     }
 
     async fn call_tool(&self, name: &str, args: &Value) -> Result<String> {
-        let Some(tool) = crate::mcp_tools::global().get(name) else {
+        let Some(tool) = crate::mcp_tools::global()
+            .get(name)
+            .filter(|_| tool_allowed(self.tool_allowlist.as_ref(), name))
+        else {
             return Err(anyhow::Error::new(UserError(format!("unknown tool: {name}"))));
         };
         // Use the tool's own `&'static str` name so the HashMap key is stable
@@ -263,6 +272,9 @@ impl McpServer {
     }
 }
 
+fn tool_allowed(allowlist: Option<&HashSet<String>>, name: &str) -> bool {
+    allowlist.is_none_or(|allowed| allowed.contains(name))
+}
 
 fn jsonrpc_response(id: Option<&Value>, result: Value) -> Value {
     json!({
@@ -814,6 +826,25 @@ fn sanitize_filename(name: &str) -> String {
         return String::new();
     }
     bounded
+}
+
+#[cfg(test)]
+mod tool_allowlist_tests {
+    use super::tool_allowed;
+    use std::collections::HashSet;
+
+    #[test]
+    fn no_allowlist_allows_every_tool() {
+        assert!(tool_allowed(None, "gmail_search"));
+    }
+
+    #[test]
+    fn allowlist_blocks_unlisted_tools() {
+        let allowed: HashSet<String> = ["weather".to_string()].into();
+        assert!(tool_allowed(Some(&allowed), "weather"));
+        assert!(!tool_allowed(Some(&allowed), "gmail_search"));
+        assert!(!tool_allowed(Some(&HashSet::new()), "weather"));
+    }
 }
 
 #[cfg(test)]

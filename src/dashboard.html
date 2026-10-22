@@ -248,7 +248,7 @@ async function loadUsage(){
     {vals:d.turns.map(x=>x.output_tokens), color:'#3fb950'}]);
   $('#chartLatency').innerHTML = lineChart([
     {vals:d.turns.map(x=>x.duration_api_ms||0), color:'#d29922'}]);
-  $('#costNote').textContent = 'Cost computed from tokens at official Opus 4.8 rates ($/1M: input 5, output 25, cache-write 6.25, cache-read 0.5). Estimate only — actual billed spend may differ (subscription plans, proxies, discounts). Cache-write cost grows when prompt caching misses.';
+  $('#costNote').textContent = 'Cost computed from tokens at '+d.cost_basis+'. Estimate only — the CLI’s own cost field is ignored. Cache-write is billed at the 1h TTL rate (2× input).';
 }
 
 /* ---- Tools ---- */

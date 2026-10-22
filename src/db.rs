@@ -1419,17 +1419,13 @@ impl Database {
         }))
     }
 
-    pub async fn dash_turns(&self, limit: i64) -> Result<serde_json::Value> {
-        // Cost is computed from token counts at official Claude Opus 4.8 rates
-        // ($/1M: input 5, output 25, cache-write 6.25, cache-read 0.5). The
-        // proxy's own `cost_usd` field is a cumulative, unreliable value and is
-        // ignored. This is an official-rate estimate, NOT actual proxy billing.
-        const COST: &str = "(input_tokens*5.0 + output_tokens*25.0 \
-                             + cache_creation_tokens*6.25 + cache_read_tokens*0.5)/1000000.0";
+    pub async fn dash_turns(&self, limit: i64, model: Option<&str>) -> Result<serde_json::Value> {
+        let (rates, cost_basis) = model_rates(model);
+        let cost = rates.cost_sql();
 
         let turn_sql = format!(
             "SELECT ts, turn_num, input_tokens, output_tokens, cache_creation_tokens, \
-                    cache_read_tokens, {COST} AS est_cost, duration_ms, duration_api_ms \
+                    cache_read_tokens, {cost} AS est_cost, duration_ms, duration_api_ms \
              FROM claude_turns ORDER BY id DESC LIMIT ?"
         );
         let rows = sqlx::query(&turn_sql)
@@ -1458,7 +1454,7 @@ impl Database {
                     COALESCE(SUM(output_tokens),0) AS out_tok, \
                     COALESCE(SUM(cache_creation_tokens),0) AS cw_tok, \
                     COALESCE(SUM(cache_read_tokens),0) AS cache_tok, \
-                    COALESCE(SUM({COST}),0.0) AS cost \
+                    COALESCE(SUM({cost}),0.0) AS cost \
              FROM claude_turns"
         );
         let agg = sqlx::query(&agg_sql).fetch_one(&self.pool).await?;
@@ -1466,7 +1462,7 @@ impl Database {
             "SELECT COUNT(*) AS total_turns, \
                     COALESCE(SUM(input_tokens),0) AS in_tok, \
                     COALESCE(SUM(output_tokens),0) AS out_tok, \
-                    COALESCE(SUM({COST}),0.0) AS cost \
+                    COALESCE(SUM({cost}),0.0) AS cost \
              FROM claude_turns WHERE ts >= ?"
         );
         let agg_day = sqlx::query(&agg_day_sql)
@@ -1475,7 +1471,7 @@ impl Database {
             .await?;
         Ok(serde_json::json!({
             "turns": turns,
-            "cost_basis": "official Opus 4.8 rates (estimate; not proxy billing)",
+            "cost_basis": cost_basis,
             "totals": {
                 "turns": agg.try_get::<i64, _>("total_turns")?,
                 "input_tokens": agg.try_get::<i64, _>("in_tok")?,
@@ -2127,6 +2123,93 @@ fn epoch_now() -> i64 {
         .unwrap_or_default()
 }
 
+pub struct ModelRates {
+    pub label: &'static str,
+    pub input: f64,
+    pub output: f64,
+    pub cache_write_1h: f64,
+    pub cache_read: f64,
+}
+
+impl ModelRates {
+    fn cost_sql(&self) -> String {
+        format!(
+            "(input_tokens*{:?} + output_tokens*{:?} \
+             + cache_creation_tokens*{:?} + cache_read_tokens*{:?})/1000000.0",
+            self.input, self.output, self.cache_write_1h, self.cache_read
+        )
+    }
+
+    fn summary(&self) -> String {
+        format!(
+            "{} rates ($/1M: input {}, output {}, 1h cache-write {}, cache-read {})",
+            self.label, self.input, self.output, self.cache_write_1h, self.cache_read
+        )
+    }
+}
+
+const OPUS_5_5_RATES: ModelRates = ModelRates {
+    label: "Claude Opus 5.5",
+    input: 4.0,
+    output: 20.0,
+    cache_write_1h: 8.0,
+    cache_read: 0.2,
+};
+
+const MODEL_RATES: &[(&str, ModelRates)] = &[
+    ("opus-5-5", OPUS_5_5_RATES),
+    (
+        "opus-4-8",
+        ModelRates {
+            label: "Claude Opus 4.8",
+            input: 5.0,
+            output: 25.0,
+            cache_write_1h: 10.0,
+            cache_read: 0.5,
+        },
+    ),
+    (
+        "sonnet-5-5",
+        ModelRates {
+            label: "Claude Sonnet 5.5",
+            input: 2.0,
+            output: 10.0,
+            cache_write_1h: 4.0,
+            cache_read: 0.1,
+        },
+    ),
+    (
+        "fable-5-1",
+        ModelRates {
+            label: "Claude Fable 5.1",
+            input: 10.0,
+            output: 50.0,
+            cache_write_1h: 20.0,
+            cache_read: 0.25,
+        },
+    ),
+];
+
+pub fn model_rates(model: Option<&str>) -> (&'static ModelRates, String) {
+    let found = model.and_then(|m| {
+        MODEL_RATES
+            .iter()
+            .find(|(key, _)| m.contains(key))
+            .map(|(_, rates)| rates)
+    });
+    match (found, model) {
+        (Some(rates), _) => (rates, format!("official {}", rates.summary())),
+        (None, Some(m)) => (
+            &OPUS_5_5_RATES,
+            format!("model '{m}' not in rate table — default {}", OPUS_5_5_RATES.summary()),
+        ),
+        (None, None) => (
+            &OPUS_5_5_RATES,
+            format!("model unset (CLI default) — default {}", OPUS_5_5_RATES.summary()),
+        ),
+    }
+}
+
 fn ensure_sqlite_parent_exists(database_url: &str) -> Result<()> {
     if !database_url.starts_with("sqlite:") {
         return Ok(());
@@ -2190,17 +2273,42 @@ mod dashboard_db_tests {
         // cumulative-per-turn and deliberately excluded from window fill)
         assert_eq!(latest["context_tokens"], 1200);
 
-        let turns = db.dash_turns(10).await.unwrap();
+        let turns = db.dash_turns(10, Some("claude-opus-4-8")).await.unwrap();
         assert_eq!(turns["totals"]["turns"], 2);
         assert_eq!(turns["totals"]["input_tokens"], 2200);
         assert_eq!(turns["totals"]["output_tokens"], 500);
         // chronological order after reverse: first turn first
         assert_eq!(turns["turns"][0]["turn_num"], 1);
-        // Cost is token-derived at official Opus 4.8 rates, NOT the proxy's
-        // cost_usd (0.12 + 0.18 = 0.30, which is ignored):
-        // (2200*5 + 500*25 + 50*6.25 + 1700*0.5) / 1e6 = 0.0246625
         let cost = turns["totals"]["cost_usd"].as_f64().unwrap();
-        assert!((cost - 0.0246625).abs() < 1e-9, "cost was {cost}");
+        assert!((cost - 0.02485).abs() < 1e-9, "cost was {cost}");
+        assert!(turns["cost_basis"].as_str().unwrap().contains("Opus 4.8"));
+
+        let turns = db.dash_turns(10, Some("claude-opus-5-5")).await.unwrap();
+        let cost = turns["totals"]["cost_usd"].as_f64().unwrap();
+        assert!((cost - 0.01954).abs() < 1e-9, "cost was {cost}");
+        let first_turn = turns["turns"][0]["cost_usd"].as_f64().unwrap();
+        assert!((first_turn - 0.00856).abs() < 1e-9, "turn cost was {first_turn}");
+    }
+
+    #[test]
+    fn model_rates_selects_by_model_id() {
+        let (rates, basis) = model_rates(Some("claude-opus-5-5"));
+        assert_eq!(rates.label, "Claude Opus 5.5");
+        assert_eq!(rates.cache_write_1h, 8.0);
+        assert!(basis.starts_with("official Claude Opus 5.5 rates"));
+        assert_eq!(model_rates(Some("claude-opus-4-8[1m]")).0.label, "Claude Opus 4.8");
+        assert_eq!(model_rates(Some("claude-sonnet-5-5")).0.label, "Claude Sonnet 5.5");
+        assert_eq!(model_rates(Some("claude-fable-5-1")).0.label, "Claude Fable 5.1");
+    }
+
+    #[test]
+    fn model_rates_unknown_or_unset_falls_back_labelled() {
+        let (rates, basis) = model_rates(Some("opus"));
+        assert_eq!(rates.label, "Claude Opus 5.5");
+        assert!(basis.contains("model 'opus' not in rate table"), "{basis}");
+        let (rates, basis) = model_rates(None);
+        assert_eq!(rates.label, "Claude Opus 5.5");
+        assert!(basis.contains("model unset"), "{basis}");
     }
 
     #[tokio::test]
@@ -2208,7 +2316,7 @@ mod dashboard_db_tests {
         // Regression: COALESCE(SUM(cost_usd),0) returned an INTEGER on an empty
         // table, which failed try_get::<f64>. The 0.0 literal fixes the affinity.
         let db = tmp_db().await;
-        let d = db.dash_turns(10).await.unwrap();
+        let d = db.dash_turns(10, None).await.unwrap();
         assert_eq!(d["totals"]["turns"], 0);
         assert_eq!(d["totals"]["cost_usd"], 0.0);
         assert_eq!(d["last_24h"]["cost_usd"], 0.0);

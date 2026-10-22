@@ -165,20 +165,23 @@ charts, polls every 3s). No separate process.
 
 **Config (`.env`):**
 - `DASHBOARD_AUTH_SECRET` — shared secret; unset ⇒ routes return 404 (disabled).
-- `CONTEXT_WINDOW_TOKENS` — denominator for the context-fill gauge (200000 for
-  standard opus-4-8; set 1000000 if you move to a 1M-context model).
+- `CONTEXT_WINDOW_TOKENS` — denominator for the context-fill gauge **and** the
+  auto-compaction threshold passed to the CLI (default 200000; clamped 100k–1M).
 
 **Data captured for it:** `claude_turns` (per-turn tokens/latency, written
 from `SubprocessEvent::TurnMetrics`), `claude_events` (compaction/rotation),
 `tool_calls` (written by `mcp-telegram`). All additive tables, created in
 `db.init()`.
 
-**Cost is token-derived.** The CLI's reported `cost_usd` is **ignored**.
-`dash_turns` computes cost at read time from token counts at official Opus 4.8
-rates ($/1M: input 5, output 25, cache-write 6.25, cache-read 0.5) — an
-official-rate **estimate**, not your actual bill. If you switch models, update
-the rate constants in `Database::dash_turns` (`src/db.rs`). When prompt caching
-misses, **cache-write dominates cost** — the Usage tab surfaces it.
+**Cost is token-derived.** The CLI's `cost_usd` field is **ignored**.
+`dash_turns` computes cost at read time from token counts at the official
+per-model rates of `CLAUDE_CODE_MODEL` (`model_rates` in `src/db.rs`; Opus 5.5:
+$/1M input 4, output 20, 1h cache-write 8, cache-read 0.2). Cache writes are
+priced at the 1h TTL rate because the CLI writes 1h cache entries. An unknown or
+unset model falls back to Opus 5.5 rates and the dashboard note says so. All
+rows are priced at the currently configured model's rates (no per-turn model
+column). Add new models to `MODEL_RATES`.
+When prompt caching misses, **cache-write dominates cost** — the Usage tab surfaces it.
 
 **Rotate the basic-auth password:**
 ```bash
@@ -188,3 +191,73 @@ systemctl reload nginx
 **Rotate the header secret:** change `DASHBOARD_AUTH_SECRET` in `/opt/jarvis/.env`
 AND the `proxy_set_header X-Dash-Auth` in the nginx vhost to the same value, then
 `systemctl restart jarvis-bot && systemctl reload nginx`.
+
+## Self-edit (Jarvis changes, ships and restarts itself)
+
+Owner DMs a change request → Claude calls `self_improve` → `bin/self-improve.sh`
+runs a sandboxed coding agent on branch `jarvis/<job-id>`, gates it (release
+build, tests, `--version` == sha, MCP smoke test), pushes the branch, installs
+the binaries and restarts. `jarvis-guard` holds the new build on a 45s probation
+(alive + `/health` 200) and restores the `.prev` binaries if it fails. Progress
+arrives as owner DMs; `self_improve_status` shows jobs. Full design: `CLAUDE.md`
+→ *Self-Edit & Self-Restart*.
+
+### One-time setup
+
+1. `main` on GitHub must already contain the self-edit code (jobs start from
+   `bin/VERSION`, falling back to `origin/main`).
+2. Deploy key, as the service user:
+   ```bash
+   ssh-keygen -t ed25519 -N '' -C jarvis-self-edit -f ~/.ssh/jarvis_deploy
+   cat >>~/.ssh/config <<'EOF'
+   Host github.com-jarvis
+     HostName github.com
+     User git
+     IdentityFile ~/.ssh/jarvis_deploy
+     IdentitiesOnly yes
+   EOF
+   ssh-keyscan github.com >>~/.ssh/known_hosts
+   ```
+   Add the `.pub` as a **write** deploy key on the repo
+   (`gh repo deploy-key add jarvis_deploy.pub --repo <owner>/jarvis --allow-write --title jarvis-self-edit`).
+   Deploy keys can push to every branch, so protect `main` with a ruleset
+   (require a PR, no bypass for deploy keys) — Jarvis only ever pushes `jarvis/*`.
+3. Clone (the job fetches from here; it never edits it):
+   ```bash
+   git clone git@github.com-jarvis:<owner>/jarvis.git ~/jarvis
+   ```
+4. `bash deploy/setup-ubuntu.sh` — installs `bubblewrap socat`, the AppArmor
+   `bwrap` userns profile (Ubuntu 24.04+), `jarvis-guard` root-owned at
+   `/usr/local/bin`, `bin/self-improve.sh`, `bin/VERSION`, and the guard unit.
+   Check the sandbox works under the unit's `NoNewPrivileges`:
+   ```bash
+   sudo systemd-run --wait --pipe -p User=<service-user> -p NoNewPrivileges=yes bwrap --ro-bind / / --unshare-all true; echo "exit=$?"
+   ```
+5. `/opt/jarvis/.env`: `SELF_IMPROVE_ENABLED=true` (optional caps:
+   `SELF_IMPROVE_MAX_TURNS`, `SELF_IMPROVE_MAX_BUDGET_USD`,
+   `SELF_IMPROVE_AGENT_TIMEOUT_SECS`, `SELF_IMPROVE_MODEL`), then
+   `sudo systemctl restart jarvis-bot`.
+
+**Long polling** (empty `WEBHOOK_URL`) has no `/health` listener — remove
+`--health-url …` from `ExecStart`, probation is then liveness-only.
+
+### Operating
+
+| Want | Do |
+|------|----|
+| see a job | `self_improve_status` (DM), or `data/self_improve/<job>/{state,log,summary.md}` |
+| ship after merging to `main` | DM: deploy main → `self_deploy main` |
+| roll back to an older build | `self_deploy jarvis/<older-job>` (or `main`) |
+| abort a running job | `kill -TERM -- -$(pgrep -of bin/self-improve.sh)` (whole process group) |
+| turn it off | `SELF_IMPROVE_ENABLED=false` + restart |
+| manual rollback | `cd /opt/jarvis/bin && for f in *.prev; do mv "$f" "${f%.prev}"; done` + restart |
+
+### Limits
+
+- Fully autonomous by owner choice: a prompt-injected owner turn (e.g. via a
+  fetched web page) could start a job. Gates and rollback catch broken builds,
+  not malicious-but-working code — review `jarvis/*` branches before merging.
+- A build that crashes *after* probation crash-loops until `StartLimitBurst`;
+  recover with the manual rollback above.
+- A job dies if the service restarts mid-job (`KillMode=control-group`), e.g. a
+  manual `restart_self` or a crash; just start it again.

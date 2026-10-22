@@ -104,15 +104,15 @@ pub struct ClaudeCodeConfig {
     pub timeout_secs: u64,
     pub allowed_tools: Vec<String>,
     pub session_file: String,
-    /// Fallback system prompt used when subprocess auto-restarts from a background task
-    /// that passes an empty system_prompt.
-    pub default_system_prompt: String,
+    pub system_prompt: String,
+    pub mcp_config: Option<String>,
     /// Maximum turns before forcing session rotation. 0 = disabled.
     pub session_max_turns: u32,
     /// Maximum average API duration (ms) before forcing rotation. 0 = disabled.
     pub session_max_duration_ms: u64,
     /// Number of recent durations to average for the threshold check.
     pub session_duration_window: usize,
+    pub auto_compact_window: u64,
 }
 
 /// Manages a long-running Claude Code subprocess with streaming I/O.
@@ -286,7 +286,7 @@ impl ClaudeCode {
     }
 
     /// Internal: send arbitrary content (string or array) to the subprocess.
-    async fn send_content(&self, system_prompt: &str, content: serde_json::Value, activity: &str) -> Result<String> {
+    async fn send_content(&self, content: serde_json::Value, activity: &str) -> Result<String> {
         // Serialize concurrent callers — subprocess handles one turn at a time.
         // Bounded wait so a wedged in-flight turn can't block every caller forever;
         // budget = 2× turn timeout (one turn ahead of us + our own turn).
@@ -324,12 +324,7 @@ impl ClaudeCode {
 
         // If not alive, spawn a new process
         if !self.is_alive() {
-            let prompt = if system_prompt.trim().is_empty() {
-                &self.config.default_system_prompt
-            } else {
-                system_prompt
-            };
-            self.start(prompt).await?;
+            self.start().await?;
         }
 
         // Clear previous result
@@ -410,14 +405,13 @@ impl ClaudeCode {
 
     /// Send a text message (user turn) to the running subprocess.
     /// Returns the text response from Claude.
-    pub async fn send_message(&self, system_prompt: &str, user_prompt: &str, activity: &str) -> Result<String> {
-        self.send_content(system_prompt, serde_json::Value::String(user_prompt.to_string()), activity).await
+    pub async fn send_message(&self, user_prompt: &str, activity: &str) -> Result<String> {
+        self.send_content(serde_json::Value::String(user_prompt.to_string()), activity).await
     }
 
     /// Send a message with one or more images (base64) to the running subprocess.
     pub async fn send_message_with_images(
         &self,
-        system_prompt: &str,
         user_prompt: &str,
         images: &[(&str, &str)], // (base64_data, media_type)
         activity: &str,
@@ -436,11 +430,11 @@ impl ClaudeCode {
             "type": "text",
             "text": user_prompt
         }));
-        self.send_content(system_prompt, serde_json::Value::Array(content_blocks), activity).await
+        self.send_content(serde_json::Value::Array(content_blocks), activity).await
     }
 
     /// Start the Claude Code subprocess.
-    pub async fn start(&self, system_prompt: &str) -> Result<()> {
+    pub async fn start(&self) -> Result<()> {
         // Stop any existing process
         self.stop().await;
 
@@ -448,36 +442,28 @@ impl ClaudeCode {
         self.session_turn_count.store(0, Ordering::Relaxed);
         self.recent_durations_ms.lock().await.clear();
 
-        let mut cmd = Command::new(&self.config.binary);
-        cmd.arg("--print")
-            .arg("--input-format").arg("stream-json")
-            .arg("--output-format").arg("stream-json")
-            .arg("--verbose");
-
-        if let Some(model) = self.config.model.as_ref() {
-            if !model.trim().is_empty() {
-                cmd.arg("--model").arg(model.trim());
-            }
-        }
-
-        if !system_prompt.trim().is_empty() {
-            cmd.arg("--system-prompt").arg(system_prompt.trim());
-        }
-
-        if !self.config.allowed_tools.is_empty() {
-            cmd.arg("--allowedTools")
-                .arg(self.config.allowed_tools.join(","));
-        }
-
         // Resume session if available
         let session_id = self.load_session_id().await;
         if let Some(ref sid) = session_id {
-            cmd.arg("--resume").arg(sid);
             info!(session_id = %sid, "resuming claude session");
         }
 
+        let mcp_config = self.config.mcp_config.as_deref().filter(|path| {
+            let exists = std::path::Path::new(path).exists();
+            if !exists {
+                warn!(path, "claude mcp config not found — falling back to default MCP discovery");
+            }
+            exists
+        });
+
+        let mut cmd = Command::new(&self.config.binary);
+        cmd.args(spawn_args(&self.config, mcp_config, session_id.as_deref()));
+
         // Prevent nested session detection
         cmd.env_remove("CLAUDECODE");
+        if let Some(window) = auto_compact_window(&self.config) {
+            cmd.env("CLAUDE_CODE_AUTO_COMPACT_WINDOW", window.to_string());
+        }
 
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -546,20 +532,11 @@ impl ClaudeCode {
 
                     // Two-pass parse: extract raw type to detect compression events
                     if let Ok(raw) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                        if let Some(event_type) = raw.get("type").and_then(|t| t.as_str()) {
-                            let subtype = raw.get("subtype").and_then(|s| s.as_str()).unwrap_or("");
-                            let is_compression = event_type.contains("compress")
-                                || subtype.contains("compress");
-
-                            if is_compression {
-                                info!(event_type, "claude_context_compression");
-                                if let Some(ref tx) = event_tx {
-                                    let _ = tx.send(SubprocessEvent::Compression(trimmed.to_string()));
-                                }
+                        if is_compaction_event(&raw) {
+                            info!(summary = %compaction_summary(&raw), "claude_context_compression");
+                            if let Some(ref tx) = event_tx {
+                                let _ = tx.send(SubprocessEvent::Compression(trimmed.to_string()));
                             }
-                            // Known harmless types: don't log or notify
-                            // system, assistant, result — handled below
-                            // user — input echo, rate_limit_event — API rate info
                         }
                     }
 
@@ -572,16 +549,7 @@ impl ClaudeCode {
                     };
 
                     match event {
-                        StreamEvent::System { session_id, subtype } => {
-                            // Check for compression in system subtype
-                            if let Some(ref st) = subtype {
-                                if st.contains("compress") {
-                                    info!(subtype = st.as_str(), "claude_context_compression");
-                                    if let Some(ref tx) = event_tx {
-                                        let _ = tx.send(SubprocessEvent::Compression(trimmed.to_string()));
-                                    }
-                                }
-                            }
+                        StreamEvent::System { session_id, .. } => {
                             if let Some(sid) = session_id {
                                 if !session_logged {
                                     info!(session_id = %sid, "claude session started");
@@ -692,12 +660,12 @@ impl ClaudeCode {
         }
     }
 
-    /// Restart the subprocess with a new system prompt.
-    pub async fn restart(&self, system_prompt: &str) -> Result<()> {
+    /// Restart the subprocess.
+    pub async fn restart(&self) -> Result<()> {
         self.stop().await;
         // Small delay before restart
         tokio::time::sleep(Duration::from_millis(500)).await;
-        self.start(system_prompt).await
+        self.start().await
     }
 
     /// Number of completed turns in the current session.
@@ -760,6 +728,79 @@ impl ClaudeCode {
     }
 }
 
+fn spawn_args(config: &ClaudeCodeConfig, mcp_config: Option<&str>, session_id: Option<&str>) -> Vec<String> {
+    let mut args: Vec<String> = ["--print", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+    if let Some(model) = config.model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+        args.extend(["--model".to_string(), model.to_string()]);
+    }
+
+    let system_prompt = config.system_prompt.trim();
+    if !system_prompt.is_empty() {
+        args.extend(["--system-prompt".to_string(), system_prompt.to_string()]);
+    }
+
+    if let Some(path) = mcp_config {
+        args.extend(["--strict-mcp-config".to_string(), "--mcp-config".to_string(), path.to_string()]);
+    }
+
+    if !config.allowed_tools.is_empty() {
+        args.extend([
+            "--tools".to_string(),
+            builtin_tool_names(&config.allowed_tools),
+            "--allowedTools".to_string(),
+            config.allowed_tools.join(","),
+        ]);
+    }
+
+    if let Some(sid) = session_id {
+        args.extend(["--resume".to_string(), sid.to_string()]);
+    }
+
+    args
+}
+
+fn auto_compact_window(config: &ClaudeCodeConfig) -> Option<u64> {
+    (config.auto_compact_window > 0).then(|| config.auto_compact_window.clamp(100_000, 1_000_000))
+}
+
+fn is_compaction_event(raw: &serde_json::Value) -> bool {
+    let field = |k: &str| raw.get(k).and_then(|v| v.as_str()).unwrap_or("");
+    field("subtype") == "compact_boundary" || field("type").contains("compress") || field("subtype").contains("compress")
+}
+
+pub fn compaction_summary(raw: &serde_json::Value) -> String {
+    let Some(meta) = raw.get("compact_metadata") else {
+        return format!(
+            "compaction event ({}/{})",
+            raw.get("type").and_then(|v| v.as_str()).unwrap_or("?"),
+            raw.get("subtype").and_then(|v| v.as_str()).unwrap_or("?"),
+        );
+    };
+    let num = |k: &str| meta.get(k).and_then(|v| v.as_u64()).map_or("?".to_string(), |n| n.to_string());
+    format!(
+        "{} compaction: {} → {} tokens in {} ms",
+        meta.get("trigger").and_then(|v| v.as_str()).unwrap_or("unknown"),
+        num("pre_tokens"),
+        num("post_tokens"),
+        num("duration_ms"),
+    )
+}
+
+fn builtin_tool_names(allowed_tools: &[String]) -> String {
+    let mut names: Vec<&str> = Vec::new();
+    for tool in allowed_tools.iter().filter(|t| !t.starts_with("mcp__")) {
+        let name = tool.split('(').next().unwrap_or_default().trim();
+        if !name.is_empty() && !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names.join(",")
+}
+
 fn epoch_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -799,5 +840,101 @@ mod usage_tests {
             StreamEvent::Result { usage, .. } => assert!(usage.is_none()),
             _ => panic!("expected Result variant"),
         }
+    }
+}
+
+#[cfg(test)]
+mod spawn_args_tests {
+    use super::*;
+
+    fn config(allowed_tools: &[&str]) -> ClaudeCodeConfig {
+        ClaudeCodeConfig {
+            binary: "claude".into(),
+            model: Some("claude-opus-5-5".into()),
+            timeout_secs: 180,
+            allowed_tools: allowed_tools.iter().map(|t| t.to_string()).collect(),
+            session_file: String::new(),
+            system_prompt: "  static prompt  ".into(),
+            mcp_config: Some(".mcp.json".into()),
+            session_max_turns: 0,
+            session_max_duration_ms: 0,
+            session_duration_window: 3,
+            auto_compact_window: 200_000,
+        }
+    }
+
+    #[test]
+    fn auto_compact_window_clamps_to_cli_range_and_zero_disables() {
+        let mut cfg = config(&[]);
+        assert_eq!(auto_compact_window(&cfg), Some(200_000));
+        cfg.auto_compact_window = 5_000;
+        assert_eq!(auto_compact_window(&cfg), Some(100_000));
+        cfg.auto_compact_window = 2_000_000;
+        assert_eq!(auto_compact_window(&cfg), Some(1_000_000));
+        cfg.auto_compact_window = 0;
+        assert_eq!(auto_compact_window(&cfg), None);
+    }
+
+    #[test]
+    fn compact_boundary_is_detected_and_summarized() {
+        let raw: serde_json::Value = serde_json::from_str(
+            r#"{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"auto","pre_tokens":201234,"post_tokens":9876,"duration_ms":4321}}"#,
+        )
+        .unwrap();
+        assert!(is_compaction_event(&raw));
+        assert_eq!(compaction_summary(&raw), "auto compaction: 201234 → 9876 tokens in 4321 ms");
+    }
+
+    #[test]
+    fn compacting_status_and_init_are_not_compaction_events() {
+        for line in [
+            r#"{"type":"system","subtype":"status","status":"compacting"}"#,
+            r#"{"type":"system","subtype":"init","session_id":"s"}"#,
+            r#"{"type":"result","subtype":"success","result":""}"#,
+        ] {
+            let raw: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert!(!is_compaction_event(&raw), "{line}");
+        }
+        let legacy: serde_json::Value = serde_json::from_str(r#"{"type":"system","subtype":"context_compressed"}"#).unwrap();
+        assert!(is_compaction_event(&legacy));
+        assert_eq!(compaction_summary(&legacy), "compaction event (system/context_compressed)");
+    }
+
+    fn value_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+        args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).map(String::as_str)
+    }
+
+    #[test]
+    fn builtin_tool_names_skip_mcp_and_strip_specifiers() {
+        let tools: Vec<String> = ["mcp__telegram__*", "WebSearch", "Bash(git:*)", "Bash(ls:*)", "WebFetch"]
+            .iter()
+            .map(|t| t.to_string())
+            .collect();
+        assert_eq!(builtin_tool_names(&tools), "WebSearch,Bash,WebFetch");
+    }
+
+    #[test]
+    fn builtin_tool_names_empty_when_only_mcp() {
+        assert_eq!(builtin_tool_names(&["mcp__telegram__*".to_string()]), "");
+    }
+
+    #[test]
+    fn spawn_args_use_config_system_prompt_and_restrict_tools() {
+        let cfg = config(&["mcp__telegram__*", "WebSearch", "WebFetch"]);
+        let args = spawn_args(&cfg, Some(".mcp.json"), Some("sid-1"));
+        assert_eq!(value_after(&args, "--system-prompt"), Some("static prompt"));
+        assert_eq!(value_after(&args, "--model"), Some("claude-opus-5-5"));
+        assert!(args.contains(&"--strict-mcp-config".to_string()));
+        assert_eq!(value_after(&args, "--mcp-config"), Some(".mcp.json"));
+        assert_eq!(value_after(&args, "--tools"), Some("WebSearch,WebFetch"));
+        assert_eq!(value_after(&args, "--allowedTools"), Some("mcp__telegram__*,WebSearch,WebFetch"));
+        assert_eq!(value_after(&args, "--resume"), Some("sid-1"));
+    }
+
+    #[test]
+    fn spawn_args_without_mcp_config_keep_default_discovery() {
+        let args = spawn_args(&config(&[]), None, None);
+        assert!(!args.iter().any(|a| a == "--strict-mcp-config" || a == "--mcp-config"));
+        assert!(!args.iter().any(|a| a == "--tools" || a == "--allowedTools" || a == "--resume"));
     }
 }

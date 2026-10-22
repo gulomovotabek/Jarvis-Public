@@ -15,7 +15,7 @@ pub enum SecurityDecision {
 /// Gate that checks messages for spam, rate limits, and bans.
 pub struct SecurityGate {
     db: Database,
-    owner_user_id: Option<i64>,
+    owner_user_ids: HashSet<i64>,
     allowed_users: HashSet<i64>,
     /// Keywords that trigger system/arch query blocking.
     blocked_keywords: Vec<String>,
@@ -30,10 +30,10 @@ pub struct SecurityGate {
 }
 
 impl SecurityGate {
-    pub fn new(db: Database, owner_user_id: Option<i64>, allowed_users: HashSet<i64>) -> Self {
+    pub fn new(db: Database, owner_user_ids: HashSet<i64>, allowed_users: HashSet<i64>) -> Self {
         Self {
             db,
-            owner_user_id,
+            owner_user_ids,
             allowed_users,
             blocked_keywords: vec![
                 "architecture".into(),
@@ -80,7 +80,7 @@ impl SecurityGate {
         is_private: bool,
     ) -> Result<SecurityDecision> {
         // Owner always passes
-        if self.owner_user_id == Some(user_id) {
+        if self.owner_user_ids.contains(&user_id) {
             return Ok(SecurityDecision::Allow);
         }
 
@@ -139,7 +139,7 @@ mod tests {
             .expect("memory db");
         db.init().await.expect("init");
         let allowed: HashSet<i64> = allowed.iter().copied().collect();
-        SecurityGate::new(db, Some(owner), allowed)
+        SecurityGate::new(db, HashSet::from([owner]), allowed)
     }
 
     #[tokio::test]
