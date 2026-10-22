@@ -25,3 +25,4 @@ pub mod rag;
 pub mod reminders;
 pub mod scheduled_tasks;
 pub mod security;
+pub mod self_update;

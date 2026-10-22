@@ -92,7 +92,7 @@ impl ScheduledTaskService {
             task.name, task.prompt,
         );
 
-        let result = self.claude.send_message("", &user_prompt, &format!("Scheduled task · {}", task.name)).await;
+        let result = self.claude.send_message(&user_prompt, &format!("Scheduled task · {}", task.name)).await;
 
         match result {
             Ok(response) => {

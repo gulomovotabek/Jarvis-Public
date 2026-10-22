@@ -42,7 +42,6 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "pro
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = "2"
-ctrlc = "3"
 cron = "0.15"
 chrono = "0.4"
 chrono-tz = "0.10"
@@ -62,5 +61,5 @@ name = "mcp-telegram"
 path = "src/bin/mcp_server.rs"
 
 [[bin]]
-name = "jarvis-wrapper"
-path = "src/bin/wrapper.rs"
+name = "jarvis-guard"
+path = "src/bin/guard.rs"

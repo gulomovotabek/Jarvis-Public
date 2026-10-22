@@ -89,7 +89,7 @@ yoki
     );
 
     let combined_prompt = format!("[System: {}]\n\n{}", system_prompt, user_prompt);
-    let raw = claude.send_message("", &combined_prompt, "Evaluating group chat").await;
+    let raw = claude.send_message(&combined_prompt, "Evaluating group chat").await;
 
     match raw {
         Ok(ref text) => Ok(parse_decision(text)),

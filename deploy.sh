@@ -14,6 +14,8 @@ cargo build --release --manifest-path "$DEV/Cargo.toml"
 echo "Copying binaries..."
 install -m 0755 "$DEV/target/release/telegram-codex-jarvis" "$PROD/bin/"
 install -m 0755 "$DEV/target/release/mcp-telegram" "$PROD/bin/"
+install -m 0755 "$DEV/deploy/self-improve.sh" "$PROD/bin/"
+"$PROD/bin/telegram-codex-jarvis" --version >"$PROD/bin/VERSION"
 
 echo "Copying prompts..."
 cp "$DEV/prompts/"* "$PROD/prompts/"

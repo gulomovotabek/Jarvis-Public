@@ -6,7 +6,7 @@ use bot::{run_bot, AppState};
 use std::collections::HashMap;
 use std::sync::Arc;
 use telegram_codex_jarvis::chat_profiles::ChatProfileManager;
-use telegram_codex_jarvis::claude_code::{ClaudeCode, ClaudeCodeConfig, SubprocessEvent};
+use telegram_codex_jarvis::claude_code::{compaction_summary, ClaudeCode, ClaudeCodeConfig, SubprocessEvent};
 use telegram_codex_jarvis::config::Config;
 use telegram_codex_jarvis::db::Database;
 use telegram_codex_jarvis::focus::FocusManager;
@@ -15,6 +15,7 @@ use telegram_codex_jarvis::rag::RagService;
 use telegram_codex_jarvis::reminders::ReminderService;
 use telegram_codex_jarvis::scheduled_tasks::ScheduledTaskService;
 use telegram_codex_jarvis::security::SecurityGate;
+use telegram_codex_jarvis::self_update::{self, SelfUpdatePaths};
 use teloxide::prelude::*;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -22,6 +23,10 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if std::env::args().any(|a| a == "--version") {
+        println!("{}", self_update::GIT_SHA);
+        return Ok(());
+    }
     dotenvy::dotenv().ok();
     init_tracing();
 
@@ -37,14 +42,28 @@ async fn main() -> Result<()> {
         timeout_secs: config.claude_code_timeout_secs,
         allowed_tools: config.claude_code_allowed_tools.clone(),
         session_file: config.claude_code_session_file.clone(),
-        default_system_prompt: config.system_prompt_template.trim().to_string(),
+        system_prompt: config.system_prompt_template.trim().to_string(),
+        mcp_config: config.claude_code_mcp_config.clone(),
         session_max_turns: config.claude_session_max_turns,
         session_max_duration_ms: config.claude_session_max_duration_ms,
         session_duration_window: config.claude_session_duration_window,
+        auto_compact_window: config.context_window_tokens,
     }));
 
     // Claude subprocess event channel (compression notifications, unknown events)
     let (claude_event_tx, claude_event_rx) = tokio::sync::mpsc::unbounded_channel::<SubprocessEvent>();
+    let guest_claude = match build_guest_claude(&config) {
+        Ok(guest) => {
+            if let Some(ref guest) = guest {
+                guest.set_event_sender(claude_event_tx.clone()).await;
+            }
+            guest
+        }
+        Err(e) => {
+            warn!(?e, "guest_claude_disabled");
+            None
+        }
+    };
     claude.set_event_sender(claude_event_tx).await;
 
     let bot_token = config
@@ -59,13 +78,13 @@ async fn main() -> Result<()> {
 
     let focus = Arc::new(FocusManager::new(
         db.clone(),
-        config.owner_user_id,
+        config.owner_user_ids.clone(),
         config.allowed_users.clone(),
     ));
 
     let security = Arc::new(SecurityGate::new(
         db.clone(),
-        config.owner_user_id,
+        config.owner_user_ids.clone(),
         config.allowed_users.clone(),
     ));
 
@@ -110,6 +129,9 @@ async fn main() -> Result<()> {
         .as_secs() as i64;
 
     let metrics = Arc::new(BotMetrics::new());
+    let last_hb = db.get_recent_heartbeats(1).await.unwrap_or_default();
+    let accept_messages_since = accept_messages_since(started_at, last_hb.first());
+    let self_update_paths = Arc::new(SelfUpdatePaths::new(self_update::data_dir_from_database_url(&config.database_url)));
 
     let owner_user_id = config.owner_user_id;
     let has_webhook = config.webhook_url.is_some();
@@ -119,7 +141,9 @@ async fn main() -> Result<()> {
         db,
         rag,
         started_at,
+        accept_messages_since,
         claude,
+        guest_claude,
         bot_username,
         bot_user_id,
         focus,
@@ -153,12 +177,11 @@ async fn main() -> Result<()> {
     }
 
     if owner_user_id.is_none() {
-        warn!("owner_user_id_unset: set OWNER_USER_ID, the bot ignores every message without it");
+        warn!("owner_user_id_unset: set OWNER_USER_ID or OWNER_IDS, nobody gets owner access without it");
     }
 
     // Owner startup notification
     if let Some(owner_id) = owner_user_id {
-        let last_hb = state.db.get_recent_heartbeats(1).await.unwrap_or_default();
         let restart_info = if let Some((ts, source, _)) = last_hb.first() {
             let age = started_at - ts;
             if source == "clean_shutdown" {
@@ -172,8 +195,8 @@ async fn main() -> Result<()> {
 
         let mode = if has_webhook { "webhook" } else { "long-polling" };
         let msg = format!(
-            "Jarvis started\n{}\nMode: {}",
-            restart_info, mode
+            "Jarvis started\n{}\nMode: {}\nVersion: {}",
+            restart_info, mode, self_update::GIT_SHA
         );
 
         let chat_id = ChatId(owner_id);
@@ -212,6 +235,12 @@ async fn main() -> Result<()> {
             std::process::exit(0);
         });
     }
+
+    tokio::spawn(run_self_update_loop(
+        bot.clone(),
+        Arc::clone(&state),
+        Arc::clone(&self_update_paths),
+    ));
 
     run_bot(bot, Arc::clone(&state)).await?;
 
@@ -273,9 +302,10 @@ async fn run_claude_event_receiver(
         // Owner DM (only when an owner is configured).
         let Some(owner_id) = owner_id else { continue };
         let msg = match &event {
-            SubprocessEvent::Compression(raw) => {
-                format!("Claude context compression detected:\n{}", clip_str(raw, 500))
-            }
+            SubprocessEvent::Compression(raw) => match serde_json::from_str::<serde_json::Value>(raw) {
+                Ok(value) => format!("Claude context compacted: {}", compaction_summary(&value)),
+                Err(_) => format!("Claude context compression detected:\n{}", clip_str(raw, 500)),
+            },
             SubprocessEvent::SessionRotation => {
                 "Claude session rotated (fresh context started)".to_string()
             }
@@ -290,6 +320,110 @@ async fn run_claude_event_receiver(
     }
 }
 
+const SELF_UPDATE_POLL: tokio::time::Duration = tokio::time::Duration::from_secs(3);
+const RESTART_GRACE_SECS: i64 = 300;
+
+fn accept_messages_since(started_at: i64, last_heartbeat: Option<&(i64, String, Option<String>)>) -> i64 {
+    match last_heartbeat {
+        Some((ts, source, _)) if source == "clean_shutdown" && started_at - ts <= RESTART_GRACE_SECS => *ts,
+        _ => started_at,
+    }
+}
+
+async fn run_self_update_loop(bot: Bot, state: Arc<AppState>, paths: Arc<SelfUpdatePaths>) {
+    let owner_id = state.config.owner_user_id;
+    let mut idle_checks = 0u32;
+    let mut interval = tokio::time::interval(SELF_UPDATE_POLL);
+    loop {
+        interval.tick().await;
+        for notice in paths.take_notices() {
+            info!(notice = notice.as_str(), "self_update_notice");
+            if let Some(owner_id) = owner_id {
+                if let Err(e) = bot.send_message(ChatId(owner_id), &notice).await {
+                    warn!(?e, "self_update_notice_failed");
+                }
+            }
+        }
+        if !paths.restart_requested() {
+            idle_checks = 0;
+            continue;
+        }
+        let guest_idle = state.guest_claude.as_ref().is_none_or(|g| g.busy_since() == 0);
+        idle_checks = if state.claude.busy_since() == 0 && guest_idle { idle_checks + 1 } else { 0 };
+        if idle_checks < 2 {
+            continue;
+        }
+        let reason = paths.take_restart_reason().unwrap_or_default();
+        info!(reason = reason.as_str(), "self_restart");
+        if let Some(owner_id) = owner_id {
+            let _ = bot.send_message(ChatId(owner_id), format!("Restarting: {reason}")).await;
+        }
+        state.claude.stop().await;
+        if let Some(ref guest) = state.guest_claude {
+            guest.stop().await;
+        }
+        let details = serde_json::json!({ "reason": reason, "version": self_update::GIT_SHA });
+        let _ = state.db.record_heartbeat("clean_shutdown", Some(&details.to_string())).await;
+        std::process::exit(0);
+    }
+}
+
+fn build_guest_claude(config: &Config) -> Result<Option<Arc<ClaudeCode>>> {
+    if !config.guest_replies_enabled {
+        return Ok(None);
+    }
+    let system_prompt = config
+        .guest_system_prompt_template
+        .clone()
+        .context("guest system prompt missing")?;
+    let main_mcp = config
+        .claude_code_mcp_config
+        .as_deref()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+    let guest_mcp = guest_mcp_config(main_mcp.as_ref(), &config.guest_allowed_tools);
+    std::fs::write(&config.guest_mcp_config, serde_json::to_string_pretty(&guest_mcp)?)
+        .with_context(|| format!("failed to write {}", config.guest_mcp_config))?;
+    Ok(Some(Arc::new(ClaudeCode::new(ClaudeCodeConfig {
+        binary: config.claude_code_bin.clone(),
+        model: config.claude_code_model.clone(),
+        timeout_secs: config.claude_code_timeout_secs,
+        allowed_tools: config.guest_allowed_tools.clone(),
+        session_file: config.guest_session_file.clone(),
+        system_prompt: system_prompt.trim().to_string(),
+        mcp_config: Some(config.guest_mcp_config.clone()),
+        session_max_turns: config.claude_session_max_turns,
+        session_max_duration_ms: config.claude_session_max_duration_ms,
+        session_duration_window: config.claude_session_duration_window,
+        auto_compact_window: config.context_window_tokens,
+    }))))
+}
+
+const TELEGRAM_MCP_PREFIX: &str = "mcp__telegram__";
+
+fn guest_mcp_config(main: Option<&serde_json::Value>, allowed_tools: &[String]) -> serde_json::Value {
+    let allowlist: Vec<&str> = allowed_tools
+        .iter()
+        .filter_map(|t| t.strip_prefix(TELEGRAM_MCP_PREFIX))
+        .collect();
+    let telegram = main
+        .and_then(|m| m.pointer("/mcpServers/telegram"))
+        .filter(|_| !allowlist.is_empty())
+        .cloned();
+    let Some(mut telegram) = telegram else {
+        return serde_json::json!({ "mcpServers": {} });
+    };
+    let Some(server) = telegram.as_object_mut() else {
+        return serde_json::json!({ "mcpServers": {} });
+    };
+    let env = server.entry("env").or_insert_with(|| serde_json::json!({}));
+    if !env.is_object() {
+        *env = serde_json::json!({});
+    }
+    env["MCP_TOOL_ALLOWLIST"] = serde_json::Value::String(allowlist.join(","));
+    serde_json::json!({ "mcpServers": { "telegram": telegram } })
+}
+
 fn clip_str(s: &str, max: usize) -> &str {
     if s.len() <= max { s } else { &s[..max] }
 }
@@ -301,4 +435,51 @@ fn init_tracing() {
         .with_target(false)
         .compact()
         .init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recent_clean_shutdown_keeps_messages_sent_during_restart() {
+        let hb = (1_000, "clean_shutdown".to_string(), None);
+        assert_eq!(accept_messages_since(1_010, Some(&hb)), 1_000);
+        assert_eq!(accept_messages_since(1_000 + RESTART_GRACE_SECS + 1, Some(&hb)), 1_000 + RESTART_GRACE_SECS + 1);
+        let crash = (1_000, "bot".to_string(), None);
+        assert_eq!(accept_messages_since(1_010, Some(&crash)), 1_010);
+        assert_eq!(accept_messages_since(1_010, None), 1_010);
+    }
+
+    fn tools(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    #[test]
+    fn guest_mcp_config_keeps_only_telegram_with_allowlist() {
+        let main = serde_json::json!({
+            "mcpServers": {
+                "telegram": { "command": "/opt/jarvis/bin/mcp-telegram", "cwd": "/opt/jarvis", "env": { "A": "1" } },
+                "other": { "command": "x" }
+            }
+        });
+        let guest = guest_mcp_config(
+            Some(&main),
+            &tools(&["mcp__telegram__weather", "mcp__telegram__now", "WebSearch"]),
+        );
+        let servers = guest["mcpServers"].as_object().unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(guest["mcpServers"]["telegram"]["command"], "/opt/jarvis/bin/mcp-telegram");
+        assert_eq!(guest["mcpServers"]["telegram"]["env"]["A"], "1");
+        assert_eq!(guest["mcpServers"]["telegram"]["env"]["MCP_TOOL_ALLOWLIST"], "weather,now");
+    }
+
+    #[test]
+    fn guest_mcp_config_fails_closed() {
+        let empty = serde_json::json!({ "mcpServers": {} });
+        let main = serde_json::json!({ "mcpServers": { "telegram": { "command": "x" } } });
+        assert_eq!(guest_mcp_config(None, &tools(&["mcp__telegram__weather"])), empty);
+        assert_eq!(guest_mcp_config(Some(&empty), &tools(&["mcp__telegram__weather"])), empty);
+        assert_eq!(guest_mcp_config(Some(&main), &tools(&["WebSearch"])), empty);
+    }
 }

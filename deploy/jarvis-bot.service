@@ -20,7 +20,7 @@ WorkingDirectory=/opt/jarvis
 # exists (subscription billing). HOME must point at that user for OAuth creds.
 Environment=HOME=/home/__USER__
 
-ExecStart=/opt/jarvis/bin/telegram-codex-jarvis
+ExecStart=/usr/local/bin/jarvis-guard --health-url http://127.0.0.1:8081/health --data-dir /opt/jarvis/data -- /opt/jarvis/bin/telegram-codex-jarvis
 
 Restart=always
 RestartSec=3

@@ -75,10 +75,14 @@ pub mod publish_blog;
 pub mod query;
 pub mod read_memory;
 pub mod remove_monitored_group;
+pub mod restart_self;
 #[cfg(feature = "rss")]
 pub mod rss_read;
 pub mod search_memories;
 pub mod search_messages;
+pub mod self_deploy;
+pub mod self_improve;
+pub mod self_improve_status;
 pub mod send_audio;
 pub mod send_chat_action;
 pub mod send_contact;
@@ -263,6 +267,10 @@ pub fn global() -> &'static ToolRegistry {
         // Admin
         r.register(get_heartbeats::GetHeartbeatsTool);
         r.register(get_tool_stats::GetToolStatsTool);
+        r.register(restart_self::RestartSelfTool);
+        r.register(self_improve::SelfImproveTool);
+        r.register(self_improve_status::SelfImproveStatusTool);
+        r.register(self_deploy::SelfDeployTool);
         #[cfg(feature = "pdf")]
         r.register(extract_pdf_text::ExtractPdfTextTool);
         #[cfg(feature = "smtp")]

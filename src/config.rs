@@ -11,9 +11,11 @@ pub struct Config {
     pub claude_code_model: Option<String>,
     pub claude_code_timeout_secs: u64,
     pub claude_code_session_file: String,
+    pub claude_code_mcp_config: Option<String>,
     pub database_url: String,
     pub allowed_users: HashSet<i64>,
     pub owner_user_id: Option<i64>,
+    pub owner_user_ids: HashSet<i64>,
     pub bot_aliases: Vec<String>,
     pub rag_top_k: usize,
     pub rag_candidate_limit: usize,
@@ -23,6 +25,11 @@ pub struct Config {
     pub webhook_url: Option<Url>,
     pub webhook_bind: SocketAddr,
     pub claude_code_allowed_tools: Vec<String>,
+    pub guest_replies_enabled: bool,
+    pub guest_allowed_tools: Vec<String>,
+    pub guest_session_file: String,
+    pub guest_mcp_config: String,
+    pub guest_system_prompt_template: Option<String>,
     /// Monitored groups: Vec of (chat_id, optional thread_id).
     pub monitored_groups: Vec<(i64, Option<i64>)>,
     pub proactive_cooldown_secs: u64,
@@ -44,6 +51,10 @@ pub struct Config {
     pub context_window_tokens: u64,
 }
 
+const DEFAULT_GUEST_ALLOWED_TOOLS: &str = "mcp__telegram__weather,mcp__telegram__currency_rates,\
+mcp__telegram__web_search,mcp__telegram__youtube_transcript,mcp__telegram__faceit_profile,\
+mcp__telegram__faceit_matches,mcp__telegram__faceit_match,mcp__telegram__now,WebSearch";
+
 pub struct McpConfig {
     pub database_url: String,
     pub bot_token: Option<String>,
@@ -57,6 +68,7 @@ pub struct McpConfig {
     /// App password generated at https://myaccount.google.com/apppasswords.
     /// NOT the normal Gmail login — that won't work with IMAP.
     pub gmail_app_password: Option<String>,
+    pub tool_allowlist: Option<HashSet<String>>,
 }
 
 impl McpConfig {
@@ -70,11 +82,18 @@ impl McpConfig {
             google_calendar_id: optional_string("GOOGLE_CALENDAR_ID"),
             gmail_imap_user: optional_string("GMAIL_IMAP_USER"),
             gmail_app_password: optional_string("GMAIL_APP_PASSWORD"),
+            tool_allowlist: env::var("MCP_TOOL_ALLOWLIST")
+                .ok()
+                .map(|v| parse_string_list(v).into_iter().collect()),
         })
     }
 }
 
 impl Config {
+    pub fn is_owner(&self, user_id: i64) -> bool {
+        self.owner_user_ids.contains(&user_id)
+    }
+
     pub fn from_env() -> Result<Self> {
         let telegram_bot_token = optional_string("TELOXIDE_TOKEN");
         if telegram_bot_token.is_none() {
@@ -95,14 +114,19 @@ impl Config {
         };
         let claude_code_session_file = env::var("CLAUDE_CODE_SESSION_FILE")
             .unwrap_or_else(|_| "data/claude_session_id".to_string());
+        let claude_code_mcp_config = match env::var("CLAUDE_CODE_MCP_CONFIG") {
+            Ok(v) => Some(v.trim().to_string()).filter(|v| !v.is_empty()),
+            Err(_) => Some(".mcp.json".to_string()),
+        };
         let database_url =
             env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://data/jarvis.db".to_string());
 
         let allowed_users = parse_i64_list(env::var("ALLOWED_USERS").unwrap_or_default());
-        let owner_user_id = env::var("OWNER_USER_ID")
-            .ok()
-            .and_then(|v| v.parse::<i64>().ok())
-            .or_else(|| allowed_users.iter().copied().next());
+        let (owner_user_id, owner_user_ids) = parse_owner_ids(
+            env::var("OWNER_IDS").ok().as_deref(),
+            env::var("OWNER_USER_ID").ok().as_deref(),
+            &allowed_users,
+        );
 
         let bot_aliases =
             parse_string_list(env::var("BOT_ALIASES").unwrap_or_else(|_| "jarvis,bot".to_string()));
@@ -136,6 +160,20 @@ impl Config {
                 .unwrap_or_else(|_| "mcp__telegram__*,WebSearch,WebFetch".to_string()),
         );
 
+        let guest_replies_enabled = parse_bool("GUEST_REPLIES_ENABLED", true);
+        let guest_allowed_tools = parse_string_list(
+            env::var("GUEST_ALLOWED_TOOLS").unwrap_or_else(|_| DEFAULT_GUEST_ALLOWED_TOOLS.to_string()),
+        );
+        let guest_session_file = env::var("GUEST_SESSION_FILE")
+            .unwrap_or_else(|_| "data/claude_guest_session_id".to_string());
+        let guest_mcp_config =
+            env::var("GUEST_MCP_CONFIG").unwrap_or_else(|_| "data/claude_guest_mcp.json".to_string());
+        let guest_system_prompt_file = env::var("GUEST_SYSTEM_PROMPT_FILE")
+            .unwrap_or_else(|_| "prompts/guest_system_prompt.txt".to_string());
+        let guest_system_prompt_template = std::fs::read_to_string(&guest_system_prompt_file)
+            .ok()
+            .filter(|p| !p.trim().is_empty());
+
         let monitored_groups = parse_monitored_groups(env::var("MONITORED_GROUPS").unwrap_or_default());
         let proactive_cooldown_secs = parse_u64("PROACTIVE_COOLDOWN_SECS", 300)?;
         let proactive_bot_cooldown_secs = parse_u64("PROACTIVE_BOT_COOLDOWN_SECS", 60)?;
@@ -158,9 +196,11 @@ impl Config {
             claude_code_model,
             claude_code_timeout_secs,
             claude_code_session_file,
+            claude_code_mcp_config,
             database_url,
             allowed_users,
             owner_user_id,
+            owner_user_ids,
             bot_aliases,
             rag_top_k,
             rag_candidate_limit,
@@ -170,6 +210,11 @@ impl Config {
             webhook_url,
             webhook_bind,
             claude_code_allowed_tools,
+            guest_replies_enabled,
+            guest_allowed_tools,
+            guest_session_file,
+            guest_mcp_config,
+            guest_system_prompt_template,
             monitored_groups,
             proactive_cooldown_secs,
             proactive_bot_cooldown_secs,
@@ -200,6 +245,25 @@ fn optional_string(key: &str) -> Option<String> {
             Some(trimmed.to_string())
         }
     })
+}
+
+fn parse_owner_ids(
+    owner_ids: Option<&str>,
+    owner_user_id: Option<&str>,
+    allowed_users: &HashSet<i64>,
+) -> (Option<i64>, HashSet<i64>) {
+    let listed: Vec<i64> = owner_ids
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|piece| piece.trim().parse::<i64>().ok())
+        .collect();
+    let primary = owner_user_id
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .or_else(|| listed.first().copied())
+        .or_else(|| allowed_users.iter().copied().next());
+    let mut owners: HashSet<i64> = listed.into_iter().collect();
+    owners.extend(primary);
+    (primary, owners)
 }
 
 fn parse_i64_list(input: String) -> HashSet<i64> {
@@ -244,7 +308,7 @@ fn parse_u64(key: &str, default: u64) -> Result<u64> {
     }
 }
 
-fn parse_bool(key: &str, default: bool) -> bool {
+pub(crate) fn parse_bool(key: &str, default: bool) -> bool {
     match env::var(key) {
         Ok(v) => {
             let t = v.trim().to_ascii_lowercase();
@@ -275,4 +339,47 @@ fn parse_monitored_groups(input: String) -> Vec<(i64, Option<i64>)> {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owner_ids_comma_separated() {
+        let (primary, owners) = parse_owner_ids(Some("111111111, 2222222222"), None, &HashSet::new());
+        assert_eq!(primary, Some(111111111));
+        assert_eq!(owners, HashSet::from([111111111, 2222222222]));
+    }
+
+    #[test]
+    fn owner_ids_legacy_single_value() {
+        let (primary, owners) = parse_owner_ids(None, Some("111111111"), &HashSet::new());
+        assert_eq!(primary, Some(111111111));
+        assert_eq!(owners, HashSet::from([111111111]));
+    }
+
+    #[test]
+    fn owner_ids_legacy_primary_with_list() {
+        let (primary, owners) =
+            parse_owner_ids(Some("2222222222"), Some("111111111"), &HashSet::new());
+        assert_eq!(primary, Some(111111111));
+        assert_eq!(owners, HashSet::from([111111111, 2222222222]));
+    }
+
+    #[test]
+    fn owner_ids_fall_back_to_allowed_users() {
+        let (primary, owners) = parse_owner_ids(None, None, &HashSet::from([42]));
+        assert_eq!(primary, Some(42));
+        assert_eq!(owners, HashSet::from([42]));
+        assert_eq!(parse_owner_ids(None, None, &HashSet::new()), (None, HashSet::new()));
+    }
+
+    #[test]
+    fn is_owner_checks_every_owner() {
+        let (_, owners) = parse_owner_ids(Some("111111111,2222222222"), None, &HashSet::new());
+        assert!(owners.contains(&111111111));
+        assert!(owners.contains(&2222222222));
+        assert!(!owners.contains(&123));
+    }
 }

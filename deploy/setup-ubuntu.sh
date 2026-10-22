@@ -20,7 +20,23 @@ echo "==> Installing apt packages..."
 # whisper, demoparser, and headed-browser features were all removed.
 sudo apt-get update
 sudo apt-get install -y \
-    build-essential pkg-config libssl-dev curl ca-certificates
+    build-essential pkg-config libssl-dev curl ca-certificates \
+    git python3 bubblewrap socat
+
+if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = 1 ] && [ ! -f /etc/apparmor.d/bwrap ]; then
+    echo "==> AppArmor userns profile for bubblewrap (self-improve sandbox)..."
+    sudo tee /etc/apparmor.d/bwrap >/dev/null <<'EOF'
+abi <abi/4.0>,
+include <tunables/global>
+
+profile bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+
+  include if exists <local/bwrap>
+}
+EOF
+    sudo apparmor_parser -r /etc/apparmor.d/bwrap
+fi
 
 echo "==> Rust toolchain..."
 if ! command -v cargo >/dev/null 2>&1; then
@@ -65,6 +81,9 @@ echo "==> Building release binaries..."
 ( cd "$DEV" && cargo build --release )
 install -m 0755 "$DEV/target/release/telegram-codex-jarvis" "$PROD/bin/"
 install -m 0755 "$DEV/target/release/mcp-telegram" "$PROD/bin/"
+install -m 0755 "$DEV/deploy/self-improve.sh" "$PROD/bin/"
+"$PROD/bin/telegram-codex-jarvis" --version >"$PROD/bin/VERSION"
+sudo install -m 0755 -o root -g root "$DEV/target/release/jarvis-guard" /usr/local/bin/jarvis-guard
 
 echo "==> Enabling service..."
 sudo systemctl daemon-reload
@@ -76,3 +95,4 @@ echo "  1. Edit $PROD/.env (TELOXIDE_TOKEN, ANTHROPIC_API_KEY or claude login, w
 echo "  2. Start the bot:   sudo systemctl start jarvis-bot"
 echo "  3. Watch logs:      journalctl -u jarvis-bot -f"
 echo "  4. (webhook) configure Caddy or cloudflared — see deploy/README.md"
+echo "  5. (optional) self-edit: deploy key + clone + SELF_IMPROVE_ENABLED — see deploy/README.md"

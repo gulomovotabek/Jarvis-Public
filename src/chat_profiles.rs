@@ -130,7 +130,7 @@ MUHIM: Faqat JSON qaytar, boshqa hech narsa yozma. HECH QANDAY tool (bot_send_me
             "[System: {}]\n\n{}",
             system, user_prompt,
         );
-        let response = self.claude.send_message("", &combined_prompt, "Analyzing chat style").await?;
+        let response = self.claude.send_message(&combined_prompt, "Analyzing chat style").await?;
 
         // Extract JSON from response (may have markdown fences)
         let json_str = extract_json(&response)

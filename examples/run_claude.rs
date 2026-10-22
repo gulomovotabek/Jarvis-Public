@@ -14,17 +14,19 @@ async fn main() -> anyhow::Result<()> {
         timeout_secs: 120,
         allowed_tools: vec!["mcp__telegram__*".into()],
         session_file: "data/claude_session_id".into(),
-        default_system_prompt: "You are a test harness.".into(),
+        system_prompt: "You are a test harness. Answer briefly.".into(),
+        mcp_config: Some(".mcp.json".into()),
         session_max_turns: 0,
         session_max_duration_ms: 0,
         session_duration_window: 20,
+        auto_compact_window: 0,
     });
 
-    claude.start("You are a test harness. Answer briefly.").await?;
+    claude.start().await?;
     println!("alive = {}", claude.is_alive());
 
     let prompt = env::args().nth(1).unwrap_or_else(|| "Which model are you? Reply in one line.".into());
-    let reply = claude.send_message("You are a test harness. Answer briefly.", &prompt, "example run").await?;
+    let reply = claude.send_message(&prompt, "example run").await?;
     println!("--- reply ---\n{reply}");
 
     claude.stop().await;

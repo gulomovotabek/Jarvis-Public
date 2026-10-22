@@ -36,7 +36,7 @@ async fn main() -> Result<()> {
     db.init().await?;
 
     let memory = Arc::new(MemoryManager::new(db.clone()));
-    let focus = Arc::new(FocusManager::new(db.clone(), None, HashSet::new()));
+    let focus = Arc::new(FocusManager::new(db.clone(), HashSet::new(), HashSet::new()));
 
     #[cfg(feature = "faceit")]
     let faceit = config
@@ -115,6 +115,7 @@ async fn main() -> Result<()> {
         #[cfg(feature = "smtp")]
         smtp,
         tool_metrics: std::sync::Arc::new(telegram_codex_jarvis::mcp::ToolMetrics::new()),
+        tool_allowlist: config.tool_allowlist,
     };
     server.run().await
 }
